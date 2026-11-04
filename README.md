@@ -4,11 +4,11 @@ Trading Research Lab is an independent quantitative research project for proposi
 
 ## Current verified state — 2026-11-04
 
-This first public snapshot contains project documentation only. Before this snapshot, the authorized workspace contained the permanent project directives and no repository, strategy code, experiment registry, or canonical market dataset. The reconnaissance found Python 3.11.5 with NumPy, pandas, Polars, and SciPy available on the host; the checked common backtest packages were not installed. No backtest engine has been selected or implemented.
+This initial public snapshot contains project documentation and one experiment record. It does not yet contain strategy code, backtest code, or a canonical market dataset. Before the first commit, the authorized workspace contained only the permanent project directives and no repository, strategy code, experiment registry, or canonical market dataset. The reconnaissance found Python 3.11.5 with NumPy, pandas, Polars, and SciPy available on the host; the checked common backtest packages were not installed. No backtest engine has been selected or implemented.
 
 No market-data source or dataset has been verified for this project. Local MetaQuotes terminal data directories exist, but their data provenance, coverage, and redistribution rights have not been established. No matching MetaTrader, cTrader, or TradingView process was detected during reconnaissance. No demo or paper account was connected or verified.
 
-EXP-001 has not been run. No backtest or paper-trading results exist in this repository. No live or demo orders have been sent. There are no GitHub Actions, deployments, or trading-account integrations.
+EXP-001 is recorded as NON VERIFICATA and blocked before execution because no market-data source, dataset rights, or backtest engine is verified. The SMA crossover remains a proposal; no instrument, costs, or complete execution rules are frozen. No backtest or paper-trading results exist in this repository. No live or demo orders have been sent. There are no GitHub Actions, deployments, or trading-account integrations.
 
 ## Research workflow
 
