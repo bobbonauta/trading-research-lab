@@ -4,11 +4,19 @@ Trading Research Lab is an independent quantitative research project for proposi
 
 ## Current verified state — 2026-11-04
 
-This initial public snapshot contains project documentation and one experiment record. It does not yet contain strategy code, backtest code, or a canonical market dataset. Before the first commit, the authorized workspace contained only the permanent project directives and no repository, strategy code, experiment registry, or canonical market dataset. The reconnaissance found Python 3.11.5 with NumPy, pandas, Polars, and SciPy available on the host; the checked common backtest packages were not installed. No backtest engine has been selected or implemented.
+This public repository contains the permanent directives, one experiment register, a minimal backtest prototype, and synthetic technical tests. It has no verified market dataset and no market-data backtest results.
 
-No market-data source or dataset has been verified for this project. Local MetaQuotes terminal data directories exist, but their data provenance, coverage, and redistribution rights have not been established. No matching MetaTrader, cTrader, or TradingView process was detected during reconnaissance. No demo or paper account was connected or verified.
+The initial reconnaissance found Python 3.11.5 with NumPy 1.26.4, pandas 2.1.4, Polars 1.38.1, and SciPy 1.15.3 available on the host. The checked common backtest engines were not installed. The current engine in `backtest.py` uses only the Python standard library. Eight tests in `test_backtest.py` pass on synthetic bars; they do not verify market data, trading costs, or strategy performance.
 
-EXP-001 is recorded as NON VERIFICATA and blocked before execution because no market-data source, dataset rights, or backtest engine is verified. The SMA crossover remains a proposal; no instrument, costs, or complete execution rules are frozen. No backtest or paper-trading results exist in this repository. No live or demo orders have been sent. There are no GitHub Actions, deployments, or trading-account integrations.
+No market-data source or dataset has been verified for this project. Local MetaQuotes terminal data directories exist, but their data provenance, coverage, quality, and redistribution rights have not been established. No matching MetaTrader, cTrader, or TradingView process was detected during reconnaissance. No demo or paper account was connected or verified.
+
+EXP-001 is recorded as NON VERIFICATA and blocked before a market-data backtest because there is no verified data source or dataset and market-specific costs are not frozen. Its SMA crossover remains a proposal. No backtest or paper-trading performance results exist. No live or demo orders have been sent. There are no GitHub Actions, deployments, or trading-account integrations.
+
+## Prototype engine scope
+
+The engine implements the proposed daily SMA(20)/SMA(100) crossover with signals evaluated on completed bars and orders attempted at the next bar open. It supports one long position, whole units, cash-only sizing, commission, spread, slippage, rejected orders when cash cannot buy one unit, and liquidation at the final bar close. It rejects missing, inconsistent, non-finite, or out-of-order OHLC bars.
+
+It assumes full fills at the modeled price. It does not simulate partial fills, order-book liquidity, margin, dividends or corporate-action adjustments, broker-specific sessions, or a benchmark. No instrument-specific cost or data convention has been selected. Synthetic test fixtures are not market data.
 
 ## Research workflow
 
@@ -16,7 +24,7 @@ The intended chain is:
 
 **Hypothesis → Formal strategy specification → Verified data → Deterministic backtest → Chronological out-of-sample validation → Robustness checks → Selection → Authorized paper trading → Evaluation.**
 
-The first implementation should reuse one canonical data source, one backtest engine, and one experiment register. Components that do not yet exist are requirements, not claims of current capability.
+The first complete market experiment should reuse one canonical data source, one engine, and this single experiment register. Components that do not yet exist are requirements, not claims of current capability.
 
 ## Methodology
 
@@ -31,7 +39,9 @@ The first implementation should reuse one canonical data source, one backtest en
 
 ## EXP-001 proposal
 
-The authorized starting hypothesis is a long-only trend-following rule using a 20-period and 100-period simple moving average crossover on daily bars. It has not been executed. An instrument, verified dataset, execution assumptions, and cost schedule still need to be established and frozen before any market-data test. No parameter may be changed after observing the final test results.
+The starting hypothesis is that price persistence may produce a statistical advantage after realistic costs, but the effect may be absent or regime-dependent. The proposed rule is long-only: enter when SMA(20) crosses above SMA(100) and exit when SMA(20) crosses below SMA(100), on daily bars. It has not been run on market data. The instrument, verified dataset, market-specific costs, benchmark, and final evaluation periods still need to be selected and frozen before a market test.
+
+See [EXPERIMENTS.md](./EXPERIMENTS.md) for its recorded state and [test_backtest.py](./test_backtest.py) for synthetic technical checks.
 
 ## Data, security, and licensing
 
