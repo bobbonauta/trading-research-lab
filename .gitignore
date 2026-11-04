@@ -1,0 +1,60 @@
+# Credentials and local secrets
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*.secret
+
+# Local identity, editor, and machine-specific files
+*.local
+*.user
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python environments, bytecode, and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Temporary and generated files
+/tmp/
+/temp/
+*.tmp
+*.temp
+*.bak
+*.log
+
+# Local or non-redistributable market data
+data/
+datasets/
+market_data/
+raw_data/
+private_data/
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.arrow
+*.h5
+*.hdf5
+*.sqlite
+*.db
