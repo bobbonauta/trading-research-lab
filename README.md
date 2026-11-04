@@ -6,7 +6,7 @@ Trading Research Lab is an independent quantitative research project for proposi
 
 This public repository contains the permanent directives, one experiment register, a minimal backtest prototype, and synthetic technical tests. It has no verified market dataset and no market-data backtest results.
 
-The initial reconnaissance found Python 3.11.5 with NumPy 1.26.4, pandas 2.1.4, Polars 1.38.1, and SciPy 1.15.3 available on the host. The checked common backtest engines were not installed. The current engine in `backtest.py` uses only the Python standard library. Eight tests in `test_backtest.py` pass on synthetic bars; they do not verify market data, trading costs, or strategy performance.
+The host runs Python 3.11.5. Package metadata reports NumPy 1.26.4, pandas 2.1.4, Polars 1.38.1, and SciPy 1.15.3; runtime recheck found NumPy reporting 2.4.6 despite its 1.26.4 metadata, while pandas fails to import with a binary ABI mismatch (`numpy.dtype size changed`). Polars and SciPy import successfully. The checked common backtest engines were not installed. The current engine in `backtest.py` uses only the Python standard library, so the prototype does not depend on this host-library mismatch. Eight tests in `test_backtest.py` pass on synthetic bars; they do not verify market data, trading costs, or strategy performance.
 
 No market-data source or dataset has been verified for this project. Local MetaQuotes terminal data directories exist, but their data provenance, coverage, quality, and redistribution rights have not been established. No matching MetaTrader, cTrader, or TradingView process was detected during reconnaissance. No demo or paper account was connected or verified.
 
