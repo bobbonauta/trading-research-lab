@@ -174,3 +174,90 @@ Percentages are not annualized; P&L expectancy and costs are USDT. PF is net pro
 - **Attribution/licensing:** these derived metrics originate from Binance Vision and are attributed under the dataset terms already cited in EXP-001; they remain within CC BY-NC-SA 4.0 scope. No raw market files or result JSON are published. No project-wide software license is selected by this update.
 - **Local reproducibility:** run `python -B backtest.py --experiment TRL-003 --dataset-dir data/binance/spot/monthly/klines/BTCUSDT/1d --output data/binance/spot/monthly/klines/BTCUSDT/1d/TRL-003-results.json`. Result JSON SHA-256: `7DF1C4FDB9FFE55B5BD7EC0E732D5F9E91412164F7A31CA3F0AD924028D9EC14`. Engine SHA-256 used in the run: `F4EDB391CEE87B9002937F6FAA90A0CA61E7A1C029F524CF13F137C7A7E1756C`. Raw data and output JSON are ignored by Git.
 - **Decision/STOP:** EXP-003 is SCARTATA; EXP-002 and EXP-004 are INCONCLUSIVE; no strategy qualifies as a preliminary candidate. No final test was opened, no paper/forward trading or account activity was started, and no further variants or experiments are authorized by this order.
+
+## TRL-004 frozen protocol (recorded before ETH data/results)
+
+- **Initial state:** 2026-11-05; canonical workspace `E:\EA Tester`; branch `main`; clean starting HEAD `c69941bea61475c950c782f85708452c921573de`. Prior experiment sections and results are historical records and will not be edited. This section is an append-only second-instrument check.
+- **Question:** do the already-selected BTCUSDT configurations D20_10 (EXP-002) and V2_10 (EXP-004) show similar economic behavior on ETHUSDT, without any retuning? EXP-003 is excluded because it was SCARTATA in TRL-003. No new strategy or parameter choice is permitted.
+- **Fixed rules:** use the existing `make_exp_strategy_policy` implementations directly: EXP-002 entry close strictly above the prior 20 completed highs, exit close strictly below the prior 10 completed lows; EXP-004 positive close-to-close shock at least 2.0 times mean true range over the prior 14 completed bars, exit after 10 completed held bars. Current bar is excluded from channel/ATR reference as already implemented. Signal at completed UTC close; execute next UTC open. Long-only, one cash-funded position, no leverage, no position carry across windows, terminal close liquidation when accepted.
+- **Market/data:** Binance Vision Spot ETHUSDT 1d UTC, exact requested coverage 2018-01-01 through 2025-12-31. Download only the 96 monthly klines archives and their official SHA-256 sidecars into the existing canonical `data/binance/spot/monthly/klines/ETHUSDT/1d` location. Save one symbol-specific manifest and one current public `exchangeInfo` filter snapshot in that same ignored directory. Do not publish raw data. Stop before economic evaluation if any required month/checksum is absent or any critical timestamp, calendar, checksum, ZIP, or OHLC validation fails. Current exchange filters are only a present-day simulation constraint; historical changes are unknown.
+- **Windows:** separate simulations for 2018-01-01–2021-12-31 (1,461 sessions), 2022-01-01–2023-12-31 (730), and 2024-01-01–2025-12-31 (731). Each starts with 10,000 USDT and flat cash. Causal warm-up may use only preceding bars from this ETH dataset; no position or equity carries. Run every strategy, window, and cost case in one invocation so results from an early window cannot drive a later choice. Do not produce a combined aggregate return; independent window resets do not define one coherently compounded portfolio under this protocol.
+- **Costs and benchmark:** same as TRL-003: base commission 10 bps per fill, full spread 2 bps and slippage 3 bps per side; doubled stress 20/4/6 bps. Model ETHUSDT quantity/notional constraints from its saved current exchangeInfo snapshot using the existing constraint logic. Benchmark each window with independently started ETHUSDT buy-and-hold, same capital, costs, and constraints. Report strategy-minus-benchmark return in percentage points for every window/cost case.
+- **Required economic outputs:** for both strategies, each of the three windows, and both cost cases, record net return (not annualized), profit factor, maximum daily-close drawdown, completed trades, expectancy, win rate, close-based exposure, costs, final equity, fills/rejections/terminal position, benchmark return/drawdown/costs, and return difference versus benchmark. Retain local trade-level records. Trade percentiles use linear interpolation over sorted net P&L values at position (n-1)*p; report null percentiles when there are no trades. Summarize the trade distribution with count of winners/losers, median, 5th/95th percentiles, best/worst net trade, and top-one/top-three winner shares of the sum of positive trade P&L; null where no trades/winners. These concentration measures are descriptive, not inferential.
+- **Predeclared interpretation, per period:** fewer than 30 completed trades in either cost case is **INCONCLUSIVE** for that strategy-period. At 30 or more in both cases, any non-positive net return or PF <= 1 in either case means the configuration does not pass the economic check for that period. Preliminary favorable historical evidence requires at least 30 in both cases, positive return and PF > 1 in both cases, and maximum drawdown below the corresponding buy-and-hold drawdown in both cases. This is not a promotion criterion or evidence of future profitability.
+- **Cross-instrument comparison:** compare only the same frozen configuration and matching 2018-2021 and 2022-2023 windows against the already-recorded BTC TRL-003 results; do not rerun BTC. BTC EXP-002/EXP-004 results for 2024-2025 do not exist under the frozen research, so make no same-strategy BTC comparison for that period. BTC and ETH returns are not independent because the markets are correlated and share the venue/data source.
+- **Implementation and verification:** adapt only the existing loader, symbol-specific filenames/filter validation, and existing run path. Keep the same engine, costs, accounting, metrics and benchmark; add only necessary ETH-focused synthetic tests. Run the existing complete suite before any ETH economic evaluation. No new dependencies, second engine, registry, service, branch, or data source.
+- **Source/license:** Binance Public Data Spot monthly klines and official `.CHECKSUM` sidecars; Binance Vision Dataset Terms v1.0 (2026-08-26) permit personal non-production historical backtesting for non-commercial research and require attribution plus CC BY-NC-SA 4.0 for redistributed derivatives. Raw ETH data and trade-level results remain local/ignored. Sources: [Binance Public Data format and timestamp notes](https://github.com/binance/binance-public-data/blob/master/README.md), [Binance Vision Dataset Terms](https://github.com/binance/binance-public-data/blob/master/TERMS_AND_CONDITIONS.md), [Binance Spot filters](https://github.com/binance/binance-spot-api-docs/blob/master/filters.md).
+
+
+## TRL-004 results (single frozen ETHUSDT evaluation)
+
+- **Esecuzione:** 2026-11-05, dopo 30/30 test sintetici/regressione e ricaricamento QC del dataset. Un solo avvio ha calcolato 12 esecuzioni strategia (2 configurazioni x 3 finestre x 2 costi) e 6 benchmark (3 finestre x 2 costi). I parametri non sono stati cambiati dopo aver visto i risultati. Nessun backtest BTC è stato ripetuto.
+- **Dati e provenienza:** Binance Vision Spot ETHUSDT 1d UTC, 96 archivi mensili, 2.922 barre dal 2018-01-01 al 2025-12-31; 2.557 righe con timestamp in millisecondi e 365 in microsecondi. Manifest SHA-256: `3b8dafafd7c1f2f7a30fbc25be4802d3bfdf2d3008cb7f38cf577b42e994ffbb`. Snapshot pubblico exchangeInfo, acquisito `2026-11-05T12:52:31.983861Z`, SHA-256: `3caa914a54d00752143074dff767a59c72a21c55b87a27ba7794ab194bc6fd69`. Filtri applicati: quantità min/step 0.0001 ETH, max 3296.98395916 ETH, notional minimo 5 USDT.
+- **Protocollo eseguito:** D20_10 (EXP-002) e V2_10 (EXP-004), regole congelate sopra; finestre indipendenti da 10.000 USDT, warm-up solo storico e nessun capitale/posizione trasferiti. Commissioni/spread totale/slippage per lato: 10/2/3 bps base e 20/4/6 bps stress. Ogni benchmark compra ETH alla prima apertura e liquida alla chiusura finale con gli stessi costi e vincoli. Rendimento non annualizzato; drawdown su equity a chiusura giornaliera. Nessun rendimento aggregato è calcolato tra finestre con capitale resettato.
+
+### Metriche strategia e benchmark
+
+| Strategia/config. | Finestra | Caso costi | Esito | Rendimento % | B&H % | Delta pp | PF | Max DD % (B&H %) | Trade | Expectancy USDT | Win % | Esposizione % | Costi USDT | Equity finale USDT |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| EXP-002 D20_10 | 2018-2021 sviluppo BTC | base | INCONCLUSIVE | 1275.95 | 400.12 | 875.83 | 23.56 | 58.54 (93.97) | 17 | 7505.61 | 64.71 | 43.26 | 1355.24 | 137595.33 |
+| EXP-002 D20_10 | 2018-2021 sviluppo BTC | stress x2 | INCONCLUSIVE | 1211.99 | 398.72 | 813.27 | 22.06 | 59.57 (93.97) | 17 | 7129.38 | 52.94 | 43.26 | 2611.51 | 131199.44 |
+| EXP-002 D20_10 | 2022-2023 validazione BTC | base | INCONCLUSIVE | -5.91 | -38.10 | 32.19 | 0.91 | 47.69 (74.00) | 11 | -53.71 | 36.36 | 33.56 | 275.40 | 9409.23 |
+| EXP-002 D20_10 | 2022-2023 validazione BTC | stress x2 | INCONCLUSIVE | -8.76 | -38.27 | 29.51 | 0.87 | 48.92 (74.00) | 11 | -79.65 | 36.36 | 33.56 | 542.75 | 9123.85 |
+| EXP-002 D20_10 | 2024-2025 estensione | base | INCONCLUSIVE | -29.10 | 29.86 | -58.97 | 0.68 | 47.97 (63.75) | 13 | -223.87 | 46.15 | 33.65 | 319.13 | 7089.63 |
+| EXP-002 D20_10 | 2024-2025 estensione | stress x2 | INCONCLUSIVE | -31.64 | 29.50 | -61.14 | 0.65 | 49.62 (63.75) | 13 | -243.37 | 38.46 | 33.65 | 626.94 | 6836.21 |
+| EXP-004 V2_10 | 2018-2021 sviluppo BTC | base | INCONCLUSIVE | 63.44 | 400.12 | -336.68 | 2.40 | 25.51 (93.97) | 13 | 487.99 | 53.85 | 8.90 | 447.76 | 16343.84 |
+| EXP-004 V2_10 | 2018-2021 sviluppo BTC | stress x2 | INCONCLUSIVE | 57.60 | 398.72 | -341.13 | 2.25 | 25.72 (93.97) | 13 | 443.05 | 53.85 | 8.90 | 877.52 | 15759.66 |
+| EXP-004 V2_10 | 2022-2023 validazione BTC | base | INCONCLUSIVE | 10.57 | -38.10 | 48.67 | 1.77 | 17.35 (74.00) | 6 | 176.16 | 66.67 | 8.22 | 193.35 | 11056.95 |
+| EXP-004 V2_10 | 2022-2023 validazione BTC | stress x2 | INCONCLUSIVE | 8.73 | -38.27 | 47.00 | 1.60 | 18.04 (74.00) | 6 | 145.46 | 50.00 | 8.22 | 383.43 | 10872.74 |
+| EXP-004 V2_10 | 2024-2025 estensione | base | INCONCLUSIVE | 25.06 | 29.86 | -4.80 | 2.25 | 17.12 (63.75) | 6 | 417.69 | 66.67 | 8.21 | 192.52 | 12506.17 |
+| EXP-004 V2_10 | 2024-2025 estensione | stress x2 | INCONCLUSIVE | 22.98 | 29.50 | -6.52 | 2.13 | 17.47 (63.75) | 6 | 382.96 | 66.67 | 8.21 | 381.60 | 12297.79 |
+
+| Benchmark ETH buy-and-hold | Finestra | Caso costi | Rendimento % | Max DD % | Costi USDT | Equity finale USDT |
+|---|---|---|---:|---:|---:|---:|
+| ETHUSDT | 2018-2021 sviluppo BTC | base | 400.12 | 93.97 | 84.08 | 50012.29 |
+| ETHUSDT | 2018-2021 sviluppo BTC | stress x2 | 398.72 | 93.97 | 167.89 | 49872.26 |
+| ETHUSDT | 2022-2023 validazione BTC | base | -38.10 | 74.00 | 22.66 | 6189.87 |
+| ETHUSDT | 2022-2023 validazione BTC | stress x2 | -38.27 | 74.00 | 45.26 | 6172.57 |
+| ETHUSDT | 2024-2025 estensione | base | 29.86 | 63.75 | 32.19 | 12986.39 |
+| ETHUSDT | 2024-2025 estensione | stress x2 | 29.50 | 63.75 | 64.28 | 12950.09 |
+
+### Distribuzione trade e concentrazione
+
+| Strategia/config. | Finestra | Caso costi | Vinti/persi/zero | Mediana USDT | P05 USDT | P95 USDT | Migliore/peggiore USDT | Quota top-1/top-3 vincitori % |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| EXP-002 D20_10 | 2018-2021 sviluppo BTC | base | 11/6/0 | 781.00 | -1436.37 | 42395.96 | 47666.42/-1467.28 | 35.77/82.53 |
+| EXP-002 D20_10 | 2018-2021 sviluppo BTC | stress x2 | 9/8/0 | 750.85 | -1451.90 | 40536.98 | 45795.58/-1489.15 | 36.07/82.74 |
+| EXP-002 D20_10 | 2022-2023 validazione BTC | base | 4/7/0 | -695.19 | -1480.77 | 1930.39 | 2108.92/-1946.36 | 35.86/87.32 |
+| EXP-002 D20_10 | 2022-2023 validazione BTC | stress x2 | 4/7/0 | -701.76 | -1493.10 | 1870.28 | 2025.12/-1961.53 | 35.65/87.55 |
+| EXP-002 D20_10 | 2024-2025 estensione | base | 6/7/0 | -564.22 | -1928.11 | 1784.51 | 1994.82/-1991.91 | 32.68/80.23 |
+| EXP-002 D20_10 | 2024-2025 estensione | stress x2 | 5/8/0 | -580.15 | -1912.43 | 1733.55 | 1918.50/-2004.67 | 32.76/81.00 |
+| EXP-004 V2_10 | 2018-2021 sviluppo BTC | base | 7/6/0 | 31.26 | -1854.92 | 3356.74 | 4884.01/-2853.67 | 44.89/84.00 |
+| EXP-004 V2_10 | 2018-2021 sviluppo BTC | stress x2 | 7/6/0 | 1.67 | -1849.66 | 3223.58 | 4720.42/-2803.56 | 45.47/85.04 |
+| EXP-004 V2_10 | 2022-2023 validazione BTC | base | 4/2/0 | 105.34 | -713.20 | 1227.66 | 1344.52/-738.74 | 55.28/99.45 |
+| EXP-004 V2_10 | 2022-2023 validazione BTC | stress x2 | 3/3/0 | 71.03 | -737.89 | 1191.68 | 1306.68/-764.44 | 56.42/100.00 |
+| EXP-004 V2_10 | 2024-2025 estensione | base | 4/2/0 | 653.18 | -1269.97 | 1601.51 | 1602.63/-1539.47 | 35.56/95.13 |
+| EXP-004 V2_10 | 2024-2025 estensione | stress x2 | 4/2/0 | 621.15 | -1286.47 | 1551.41 | 1554.71/-1552.57 | 35.84/95.66 |
+
+Percentili calcolati con interpolazione lineare sui P&L netti per trade ordinati, in posizione `(n-1)*p`; `—` indica metrica non definita. Le quote top-1/top-3 sono percentuali del P&L positivo complessivo e sono descrittive, non inferenziali.
+
+### Confronto con le metriche BTC già registrate in TRL-003
+
+| Esperimento/config. | Finestra | BTC rendimento base/stress % | ETH rendimento base/stress % | BTC PF base/stress | ETH PF base/stress | BTC DD base/stress % | ETH DD base/stress % | Trade BTC / ETH base-stress |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| EXP-002 D20_10 | 2018-2021 | 861.61/822.06 | 1275.95/1211.99 | 2.83/2.78 | 23.56/22.06 | 37.66/38.09 | 58.54/59.57 | 15/15; 17/17 |
+| EXP-002 D20_10 | 2022-2023 | -0.78/-3.79 | -5.91/-8.76 | 0.98/0.92 | 0.91/0.87 | 39.19/39.96 | 47.69/48.92 | 11/11; 11/11 |
+| EXP-004 V2_10 | 2018-2021 | 103.25/94.89 | 63.44/57.60 | 4.63/4.27 | 2.40/2.25 | 21.74/21.96 | 25.51/25.72 | 15/15; 13/13 |
+| EXP-004 V2_10 | 2022-2023 | 30.17/27.65 | 10.57/8.73 | 2.00/1.89 | 1.77/1.60 | 19.56/19.79 | 17.35/18.04 | 7/7; 6/6 |
+
+Non esistono risultati BTC D20_10/V2_10 2024-2025 nella ricerca congelata; nessun confronto o rerun BTC è stato effettuato per tale finestra. BTC ed ETH sono mercati correlati e condividono venue/fonte, quindi ETH è una verifica su un secondo strumento ma non un campione di mercato indipendente.
+
+### Decisione, limiti e riproducibilità
+
+- Tutte le sei combinazioni strategia-finestra sono **INCONCLUSIVE** secondo la soglia predefinita: 17/11/13 trade per D20_10 e 13/6/6 per V2_10, sempre sotto 30 in entrambe le ipotesi di costo. Nessuna configurazione è promossa o candidata al paper trading.
+- EXP-002 perde in entrambe le ipotesi di costo nel 2022-2023 e nel 2024-2025; nel 2024-2025 sottoperforma ETH buy-and-hold di 58.97/61.14 punti percentuali. Il risultato molto alto 2018-2021 non supera il gate campionario e il top-3 trade rappresenta 82.53/82.74% del P&L positivo.
+- EXP-004 è positiva in tutte le finestre ETH, ma nel 2018-2021 è molto sotto buy-and-hold (-336.68/-341.13 pp), nel 2022-2023 è sopra il benchmark in un periodo ribassista (+48.67/+47.00 pp), e nel 2024-2025 resta sotto il benchmark (-4.80/-6.52 pp). I campioni sono 13/6/6 trade e il top-3 assorbe 84.00-100.00% del P&L positivo a seconda di finestra/costi: evidenza insufficiente.
+- Tutte le 12 simulazioni strategiche hanno zero ordini rifiutati e terminano flat; i record completi trade-level sono nel JSON locale. Il motore usa costi stimati, riempimenti completi e il filtro quantità/notional osservato soltanto il 2026-11-05; non ricostruisce spread, slippage, filtri o liquidità storici. Nessun paper trading, replay prospettico, collegamento a conti o ordine è stato avviato.
+- Dati grezzi e JSON con record trade restano locali e ignorati da Git. I risultati derivati pubblicati sono attribuiti a Binance Vision e restano soggetti ai termini CC BY-NC-SA 4.0 indicati in TRL-004 frozen protocol; nessuna licenza software generale è scelta. Fonti: [Binance Public Data README](https://github.com/binance/binance-public-data/blob/master/README.md), [Binance Vision Dataset Terms](https://github.com/binance/binance-public-data/blob/master/TERMS_AND_CONDITIONS.md).
+- **File e hash:** JSON locale `data/binance/spot/monthly/klines/ETHUSDT/1d/TRL-004-results.json`; SHA-256 `DF5D51A9890BABEC9A627E3E8667399F58DC7A171CAC39E1DB0BA2BDBEBD62B6`. Motore registrato dalla run: SHA-256 `FD3CBFEF3E03BD02158395303CCC4A8960EEF795B87DF78B9E745A048565A644`. Riproducibilità: `python -B backtest.py --experiment TRL-004 --dataset-dir data/binance/spot/monthly/klines/ETHUSDT/1d --output data/binance/spot/monthly/klines/ETHUSDT/1d/TRL-004-results.json`.
+- **Decisione/STOP:** ciclo TRL-004 completato tecnicamente; risultati economici ETH tutti inconcludenti per numerosità, nessuna promozione. Nessun TRL-005 o paper trading è autorizzato da questo ordine.

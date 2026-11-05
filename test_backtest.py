@@ -13,6 +13,7 @@ from backtest import (
     Bar,
     CostModel,
     QuantityConstraints,
+    _trade_distribution,
     SignalDecision,
     compute_window_metrics,
     load_binance_quantity_constraints,
@@ -47,10 +48,10 @@ def make_kline_row(session, *, unit, open_price="100", high="102", low="99", clo
     ]
 
 
-def write_fixture_dataset(root: Path, rows):
+def write_fixture_dataset(root: Path, rows, *, symbol="BTCUSDT"):
     root.mkdir(parents=True, exist_ok=True)
-    name = "BTCUSDT-1d-2025-01.zip"
-    csv_name = "BTCUSDT-1d-2025-01.csv"
+    name = f"{symbol}-1d-2025-01.zip"
+    csv_name = f"{symbol}-1d-2025-01.csv"
     buffer = io.StringIO(newline="")
     csv.writer(buffer, lineterminator="\n").writerows(rows)
     zip_path = root / name
@@ -370,6 +371,60 @@ class BacktestTests(unittest.TestCase):
             self.assertEqual(len(loaded.bars), 1)
             self.assertEqual(loaded.bars[0].session, "2025-01-01")
             self.assertEqual(loaded.archive_count, 1)
+
+
+    def test_eth_symbol_loader_and_quantity_constraints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_fixture_dataset(root, [
+                make_kline_row(date(2025, 1, 1), unit=1_000_000),
+                make_kline_row(date(2025, 1, 2), unit=1_000_000),
+            ], symbol="ETHUSDT")
+            loaded = load_binance_vision_klines(
+                root, start_session=date(2025, 1, 1), end_session=date(2025, 1, 2), symbol="ETHUSDT",
+            )
+            self.assertEqual(len(loaded.bars), 2)
+            self.assertEqual(loaded.microseconds_rows, 2)
+            self.assertEqual(loaded.bars[0].session, "2025-01-01")
+            snapshot = root / "exchange_filters_snapshot.json"
+            snapshot.write_text(json.dumps({
+                "symbol": "ETHUSDT",
+                "filters": [
+                    {"filterType": "LOT_SIZE", "minQty": "0.00010000", "maxQty": "9000", "stepSize": "0.00010000"},
+                    {"filterType": "MARKET_LOT_SIZE", "minQty": "0", "maxQty": "3296.98395916", "stepSize": "0"},
+                    {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True,
+                     "maxNotional": "9000000", "applyMaxToMarket": False},
+                ],
+            }), encoding="utf-8")
+            rules = load_binance_quantity_constraints(snapshot, symbol="ETHUSDT")
+            self.assertEqual(rules.min_quantity, 0.0001)
+            self.assertEqual(rules.step_size, 0.0001)
+            self.assertEqual(rules.max_quantity, 3296.98395916)
+            self.assertEqual(rules.min_notional, 5)
+
+    def test_trade_distribution_reports_quantiles_and_winner_concentration(self):
+        closes = [100, 110, 100, 120, 130, 130, 100, 90, 80, 80]
+        bars = make_bars(closes)
+
+        def policy(history, in_position, bars_held):
+            count = len(history)
+            if not in_position and count in (2, 6):
+                return SignalDecision("BUY", "exp002_channel_breakout")
+            if in_position and count in (4, 8):
+                return SignalDecision("SELL", "exp002_channel_exit")
+            return None
+
+        result = run_backtest(
+            bars, initial_capital=1_000, costs=ZERO_COSTS,
+            constraints=QuantityConstraints(1, 1, 100, 0), signal_policy=policy,
+        )
+        distribution = _trade_distribution(result)
+        self.assertEqual(distribution["trade_count"], 2)
+        self.assertEqual(distribution["winner_count"], 1)
+        self.assertEqual(distribution["loser_count"], 1)
+        self.assertEqual(distribution["top_1_winner_share_pct"], 100)
+        self.assertEqual(distribution["top_3_winner_share_pct"], 100)
+        self.assertGreater(distribution["p95_net_pnl_usdt"], distribution["p05_net_pnl_usdt"])
 
 
 if __name__ == "__main__":

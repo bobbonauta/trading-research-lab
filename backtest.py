@@ -221,19 +221,20 @@ def parse_binance_kline_row(row: Sequence[str], *, source: str = "kline") -> tup
     return Bar(session.isoformat(), float(o), float(h), float(low), float(c)), unit
 
 
-def _month_names(start: date, end: date) -> tuple[str, ...]:
+def _month_names(start: date, end: date, *, symbol: str = "BTCUSDT") -> tuple[str, ...]:
     if start > end:
         raise ValueError("start date must not follow end date")
+    if not symbol or not symbol.isalnum():
+        raise ValueError("symbol must contain only letters and digits")
     names = []
     year, month = start.year, start.month
     while (year, month) <= (end.year, end.month):
-        names.append(f"BTCUSDT-1d-{year:04d}-{month:02d}.zip")
+        names.append(f"{symbol}-1d-{year:04d}-{month:02d}.zip")
         if month == 12:
             year, month = year + 1, 1
         else:
             month += 1
     return tuple(names)
-
 
 def _expected_sessions(start: date, end: date) -> tuple[str, ...]:
     result = []
@@ -254,6 +255,7 @@ def _sha256_file(path: Path) -> str:
 
 def load_binance_vision_klines(
     dataset_dir: str | Path, *, start_session: date = DEFAULT_START, end_session: date = DEFAULT_END,
+    symbol: str = "BTCUSDT",
 ) -> LoadedDataset:
     root = Path(dataset_dir)
     manifest_path = root / "download_manifest.json"
@@ -263,8 +265,8 @@ def load_binance_vision_klines(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("dataset manifest is unreadable") from exc
-    expected_files = _month_names(start_session, end_session)
-    actual_files = {p.name for p in root.glob("BTCUSDT-1d-????-??.zip")}
+    expected_files = _month_names(start_session, end_session, symbol=symbol)
+    actual_files = {p.name for p in root.glob(f"{symbol}-1d-????-??.zip")}
     if not set(expected_files).issubset(actual_files):
         raise ValueError("monthly archive set is missing files for requested period")
     records = manifest.get("archives")
@@ -312,11 +314,11 @@ def load_binance_vision_klines(
     )
 
 
-def load_binance_quantity_constraints(snapshot_path: str | Path) -> QuantityConstraints:
+def load_binance_quantity_constraints(snapshot_path: str | Path, *, symbol: str = "BTCUSDT") -> QuantityConstraints:
     try:
         snapshot = json.loads(Path(snapshot_path).read_text(encoding="utf-8-sig"))
-        if snapshot.get("symbol") != "BTCUSDT":
-            raise ValueError("snapshot is not BTCUSDT")
+        if snapshot.get("symbol") != symbol:
+            raise ValueError(f"snapshot is not {symbol}")
         filters = {item["filterType"]: item for item in snapshot["filters"]}
         lot, market = filters["LOT_SIZE"], filters["MARKET_LOT_SIZE"]
         notional = filters.get("NOTIONAL")
@@ -335,7 +337,7 @@ def load_binance_quantity_constraints(snapshot_path: str | Path) -> QuantityCons
             min_value = Decimal(0)
         return QuantityConstraints(float(min_qty), float(step), float(max_qty) if max_qty else None, float(min_value))
     except (OSError, KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
-        raise ValueError("cannot derive BTCUSDT constraints from exchangeInfo snapshot") from exc
+        raise ValueError(f"cannot derive {symbol} constraints from exchangeInfo snapshot") from exc
 
 
 def _execution_price(reference: float, side: Side, costs: CostModel) -> float:
@@ -884,13 +886,187 @@ def run_trl003(dataset_dir: str | Path, *, initial_capital: float = 10_000.0) ->
         "benchmarks": benchmarks,
     }
 
+
+TRL004_WINDOWS = {
+    "development_2018_2021": (date(2018, 1, 1), date(2021, 12, 31), 1461),
+    "validation_2022_2023": (date(2022, 1, 1), date(2023, 12, 31), 730),
+    "extension_2024_2025": (date(2024, 1, 1), date(2025, 12, 31), 731),
+}
+TRL004_STRATEGIES = {
+    "EXP-002": {"config_id": "D20_10", "parameters": {"entry_lookback": 20, "exit_lookback": 10}},
+    "EXP-004": {"config_id": "V2_10", "parameters": {"shock_multiple": 2.0, "maximum_held_bars": 10}},
+}
+TRL004_COSTS = {"base": BASE_COSTS, "stress_double_all_costs": STRESS_COSTS}
+
+
+def _linear_quantile(sorted_values: Sequence[float], probability: float) -> float | None:
+    if not sorted_values:
+        return None
+    position = (len(sorted_values) - 1) * probability
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = position - lower
+    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+
+def _trade_distribution(result: BacktestResult) -> dict:
+    values = sorted(trade.net_pnl for trade in result.trades)
+    winners = sorted((value for value in values if value > 0), reverse=True)
+    positive_total = fsum(winners)
+    return {
+        "trade_count": len(values),
+        "winner_count": len(winners),
+        "loser_count": sum(value < 0 for value in values),
+        "zero_pnl_count": sum(value == 0 for value in values),
+        "mean_net_pnl_usdt": fsum(values) / len(values) if values else None,
+        "median_net_pnl_usdt": _linear_quantile(values, 0.5),
+        "p05_net_pnl_usdt": _linear_quantile(values, 0.05),
+        "p95_net_pnl_usdt": _linear_quantile(values, 0.95),
+        "best_net_trade_usdt": max(values) if values else None,
+        "worst_net_trade_usdt": min(values) if values else None,
+        "positive_trade_pnl_total_usdt": positive_total if winners else None,
+        "top_1_winner_share_pct": 100 * winners[0] / positive_total if positive_total else None,
+        "top_3_winner_share_pct": 100 * fsum(winners[:3]) / positive_total if positive_total else None,
+    }
+
+
+def run_trl004(dataset_dir: str | Path, *, initial_capital: float = 10_000.0) -> dict:
+    root = Path(dataset_dir)
+    loaded = load_binance_vision_klines(
+        root, start_session=date(2018, 1, 1), end_session=date(2025, 12, 31), symbol="ETHUSDT"
+    )
+    snapshot_path = root / "exchange_filters_snapshot.json"
+    constraints = load_binance_quantity_constraints(snapshot_path, symbol="ETHUSDT")
+    all_bars = loaded.bars
+    windows = {}
+    for window_id, (start, end, expected_count) in TRL004_WINDOWS.items():
+        window_bars = tuple(bar for bar in all_bars if start.isoformat() <= bar.session <= end.isoformat())
+        if len(window_bars) != expected_count:
+            raise ValueError(f"TRL-004 calendar mismatch for {window_id}")
+        history = tuple(bar for bar in all_bars if bar.session < start.isoformat())
+        windows[window_id] = {"start": start, "end": end, "bars": window_bars, "history": history}
+
+    benchmarks = {}
+    for window_id, window in windows.items():
+        benchmarks[window_id] = {}
+        for scenario, costs in TRL004_COSTS.items():
+            result = run_buy_and_hold(
+                window["bars"], initial_capital=initial_capital, costs=costs, constraints=constraints
+            )
+            metrics = compute_window_metrics(
+                result, start_session=window["start"], end_session=window["end"]
+            )
+            benchmarks[window_id][scenario] = {
+                "metrics": asdict(metrics),
+                "diagnostics": _result_diagnostics(result),
+            }
+
+    experiments = {}
+    for experiment_id, frozen in TRL004_STRATEGIES.items():
+        policy = make_exp_strategy_policy(experiment_id, frozen["parameters"])
+        experiment = {"config_id": frozen["config_id"], "windows": {}}
+        for window_id, window in windows.items():
+            cost_results = {}
+            for scenario, costs in TRL004_COSTS.items():
+                result = run_backtest(
+                    window["bars"], initial_capital=initial_capital, costs=costs,
+                    constraints=constraints, signal_policy=policy, signal_history=window["history"],
+                )
+                metrics = compute_window_metrics(
+                    result, start_session=window["start"], end_session=window["end"]
+                )
+                benchmark_metrics = benchmarks[window_id][scenario]["metrics"]
+                cost_results[scenario] = {
+                    "metrics": asdict(metrics),
+                    "return_difference_vs_buy_and_hold_pp": metrics.net_return_pct - benchmark_metrics["net_return_pct"],
+                    "benchmark_metrics": benchmark_metrics,
+                    "diagnostics": _result_diagnostics(result),
+                    "trade_distribution": _trade_distribution(result),
+                    "trade_records": [asdict(trade) for trade in result.trades],
+                }
+            base = cost_results["base"]["metrics"]
+            stress = cost_results["stress_double_all_costs"]["metrics"]
+            base_benchmark = benchmarks[window_id]["base"]["metrics"]
+            stress_benchmark = benchmarks[window_id]["stress_double_all_costs"]["metrics"]
+            gates = {
+                "at_least_30_completed_trades_in_both_cost_scenarios": (
+                    base["trade_count"] >= 30 and stress["trade_count"] >= 30
+                ),
+                "positive_net_return_in_both_cost_scenarios": (
+                    base["net_return_pct"] > 0 and stress["net_return_pct"] > 0
+                ),
+                "profit_factor_gt_1_in_both_cost_scenarios": (
+                    base["profit_factor"] is not None and base["profit_factor"] > 1
+                    and stress["profit_factor"] is not None and stress["profit_factor"] > 1
+                ),
+                "drawdown_below_benchmark_in_both_cost_scenarios": (
+                    base["max_drawdown_pct"] < base_benchmark["max_drawdown_pct"]
+                    and stress["max_drawdown_pct"] < stress_benchmark["max_drawdown_pct"]
+                ),
+            }
+            if not gates["at_least_30_completed_trades_in_both_cost_scenarios"]:
+                classification = "INCONCLUSIVE"
+            elif all(gates.values()):
+                classification = "PRELIMINARY_HISTORICALLY_FAVORABLE"
+            else:
+                classification = "DOES_NOT_PASS_ECONOMIC_CHECK"
+            experiment["windows"][window_id] = {
+                "base_and_stress": cost_results,
+                "interpretation_gates": gates,
+                "classification": classification,
+            }
+        experiments[experiment_id] = experiment
+
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
+    return {
+        "order": "TRL-004",
+        "instrument": "ETHUSDT Spot",
+        "timeframe": "1d UTC",
+        "experiments": experiments,
+        "protocol": {
+            "loaded_period": "2018-01-01 through 2025-12-31",
+            "windows": {
+                name: {"start": start.isoformat(), "end": end.isoformat(), "rows": count}
+                for name, (start, end, count) in TRL004_WINDOWS.items()
+            },
+            "initial_capital_usdt_per_window": initial_capital,
+            "quantity_constraints": asdict(constraints),
+            "cost_scenarios_bps": {name: asdict(model) for name, model in TRL004_COSTS.items()},
+            "strategies_and_configs": {name: {"config_id": item["config_id"], "parameters": item["parameters"]}
+                                       for name, item in TRL004_STRATEGIES.items()},
+            "strategy_window_scenario_runs": len(TRL004_STRATEGIES) * len(TRL004_WINDOWS) * len(TRL004_COSTS),
+            "benchmark_window_scenario_runs": len(TRL004_WINDOWS) * len(TRL004_COSTS),
+            "aggregate_return": None,
+            "aggregate_note": "Not calculated: each window starts with separately reset capital, so returns are reported per window.",
+            "paper_trading_started": False,
+        },
+        "data": {
+            "source": "Binance Vision Spot monthly klines",
+            "symbol": "ETHUSDT",
+            "archive_count_loaded": loaded.archive_count,
+            "rows_loaded": len(all_bars),
+            "milliseconds_rows": loaded.milliseconds_rows,
+            "microseconds_rows": loaded.microseconds_rows,
+            "download_manifest_sha256": loaded.manifest_sha256,
+            "exchange_info_snapshot_sha256": _sha256_file(snapshot_path),
+            "exchange_info_retrieved_utc": snapshot.get("retrieved_utc"),
+        },
+        "engine_sha256": _sha256_file(Path(__file__)),
+        "benchmarks": benchmarks,
+    }
+
 def main():
-    parser = argparse.ArgumentParser(description="Run BTCUSDT historical research with the deterministic daily-bar engine.")
+    parser = argparse.ArgumentParser(description="Run frozen BTCUSDT/ETHUSDT research configurations with the deterministic daily-bar engine.")
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--experiment", choices=("EXP-001", "TRL-003"), default="EXP-001")
+    parser.add_argument("--experiment", choices=("EXP-001", "TRL-003", "TRL-004"), default="EXP-001")
     args = parser.parse_args()
-    result = run_exp001(args.dataset_dir) if args.experiment == "EXP-001" else run_trl003(args.dataset_dir)
+    if args.experiment == "EXP-001":
+        result = run_exp001(args.dataset_dir)
+    elif args.experiment == "TRL-003":
+        result = run_trl003(args.dataset_dir)
+    else:
+        result = run_trl004(args.dataset_dir)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
