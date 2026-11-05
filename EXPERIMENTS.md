@@ -261,3 +261,9 @@ Non esistono risultati BTC D20_10/V2_10 2024-2025 nella ricerca congelata; nessu
 - Dati grezzi e JSON con record trade restano locali e ignorati da Git. I risultati derivati pubblicati sono attribuiti a Binance Vision e restano soggetti ai termini CC BY-NC-SA 4.0 indicati in TRL-004 frozen protocol; nessuna licenza software generale è scelta. Fonti: [Binance Public Data README](https://github.com/binance/binance-public-data/blob/master/README.md), [Binance Vision Dataset Terms](https://github.com/binance/binance-public-data/blob/master/TERMS_AND_CONDITIONS.md).
 - **File e hash:** JSON locale `data/binance/spot/monthly/klines/ETHUSDT/1d/TRL-004-results.json`; SHA-256 `DF5D51A9890BABEC9A627E3E8667399F58DC7A171CAC39E1DB0BA2BDBEBD62B6`. Motore registrato dalla run: SHA-256 `FD3CBFEF3E03BD02158395303CCC4A8960EEF795B87DF78B9E745A048565A644`. Riproducibilità: `python -B backtest.py --experiment TRL-004 --dataset-dir data/binance/spot/monthly/klines/ETHUSDT/1d --output data/binance/spot/monthly/klines/ETHUSDT/1d/TRL-004-results.json`.
 - **Decisione/STOP:** ciclo TRL-004 completato tecnicamente; risultati economici ETH tutti inconcludenti per numerosità, nessuna promozione. Nessun TRL-005 o paper trading è autorizzato da questo ordine.
+
+
+## TRL-004 result diagnostics supplement
+
+- **Strategy fills by window (base/stress):** EXP-002 D20_10 = 34/34 (2018-2021), 22/22 (2022-2023), 26/26 (2024-2025); EXP-004 V2_10 = 26/26, 12/12, 12/12 in the same window order. All 12 strategy cases had zero rejected orders and ended with zero open quantity.
+- **Benchmark fills:** ETH buy-and-hold had 2 fills in each of the 6 window/cost cases, zero rejected orders, and zero terminal open quantity. These diagnostics are also retained in the ignored local result JSON referenced above.
