@@ -1,4 +1,4 @@
-"""Deterministic BTCUSDT daily-bar engine and Binance Vision loader for EXP-001."""
+"""Deterministic BTCUSDT daily-bar engine and Binance Vision loader."""
 from __future__ import annotations
 
 import argparse
@@ -13,12 +13,12 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from math import fsum, isfinite
 from statistics import fmean
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 
 FAST_PERIOD = 20
 SLOW_PERIOD = 100
 Side = Literal["BUY", "SELL"]
-Reason = Literal["sma_cross", "end_of_test", "benchmark"]
+Reason = Literal["sma_cross", "end_of_test", "benchmark", "exp002_channel_breakout", "exp002_channel_exit", "exp003_rsi_entry", "exp003_rsi_exit", "exp003_time_stop", "exp004_volatility_shock", "exp004_time_stop"]
 TIMESTAMP_SWITCH_DATE = date(2025, 1, 1)
 DEFAULT_START = date(2018, 1, 1)
 DEFAULT_END = date(2025, 12, 31)
@@ -68,6 +68,15 @@ class QuantityConstraints:
 
 
 WHOLE_UNIT_CONSTRAINTS = QuantityConstraints()
+
+
+@dataclass(frozen=True)
+class SignalDecision:
+    action: Side
+    reason: Reason
+
+
+SignalPolicy = Callable[[Sequence[Bar], bool, int], SignalDecision | None]
 
 
 @dataclass(frozen=True)
@@ -255,9 +264,9 @@ def load_binance_vision_klines(
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("dataset manifest is unreadable") from exc
     expected_files = _month_names(start_session, end_session)
-    actual_files = sorted(p.name for p in root.glob("BTCUSDT-1d-????-??.zip"))
-    if set(actual_files) != set(expected_files):
-        raise ValueError("monthly archive set does not match requested period")
+    actual_files = {p.name for p in root.glob("BTCUSDT-1d-????-??.zip")}
+    if not set(expected_files).issubset(actual_files):
+        raise ValueError("monthly archive set is missing files for requested period")
     records = manifest.get("archives")
     if not isinstance(records, list):
         raise ValueError("dataset manifest has no archive records")
@@ -419,40 +428,53 @@ def _result(initial, cash, quantity, fills, rejected, trades, curve):
                           fsum(_fill_cost(fill) for fill in fills), (final - initial) / initial)
 
 
-def run_backtest(bars: Sequence[Bar], *, initial_capital: float, costs: CostModel,
-                 constraints: QuantityConstraints = WHOLE_UNIT_CONSTRAINTS) -> BacktestResult:
+def run_backtest(
+    bars: Sequence[Bar], *, initial_capital: float, costs: CostModel,
+    constraints: QuantityConstraints = WHOLE_UNIT_CONSTRAINTS,
+    signal_policy: SignalPolicy | None = None,
+    signal_history: Sequence[Bar] = (),
+) -> BacktestResult:
     data = _run_inputs(bars, initial_capital, costs, constraints)
+    prefix = tuple(signal_history)
+    if prefix:
+        prefix = _validate_bars(prefix)
+        if prefix[-1].session >= data[0].session:
+            raise ValueError("signal history must end before the simulated bars")
+    if signal_policy is None and prefix:
+        raise ValueError("signal_history requires a signal_policy")
+
     initial, cash, qty = float(initial_capital), float(initial_capital), 0.0
     entry = None
-    pending = None
+    entry_index = None
+    pending: tuple[Side, str, Reason] | None = None
     fills, rejected, trades, curve = [], [], [], []
     closes = [float(bar.close) for bar in data]
     for i, bar in enumerate(data):
-        if pending:
-            side, signal = pending
+        if pending is not None:
+            side, signal, reason = pending
             if side == "BUY" and qty == 0:
-                fill, detail = _buy(cash, float(bar.open), bar.session, signal, "sma_cross", costs, constraints)
+                fill, detail = _buy(cash, float(bar.open), bar.session, signal, reason, costs, constraints)
                 if fill is None:
-                    rejected.append(RejectedOrder(side, "sma_cross", signal, bar.session, detail or "rejected"))
+                    rejected.append(RejectedOrder(side, reason, signal, bar.session, detail or "rejected"))
                 else:
                     cash -= fill.quantity * fill.fill_price + fill.commission
                     if cash < 0 and cash > -1e-7:
                         cash = 0.0
                     if cash < 0:
                         raise ArithmeticError("cash balance became negative")
-                    qty, entry = fill.quantity, fill
+                    qty, entry, entry_index = fill.quantity, fill, i
                     fills.append(fill)
             elif side == "SELL" and qty > 0 and entry is not None:
-                fill, detail = _sell(qty, entry, float(bar.open), bar.session, signal, "sma_cross", costs, constraints)
+                fill, detail = _sell(qty, entry, float(bar.open), bar.session, signal, reason, costs, constraints)
                 if fill is None:
-                    rejected.append(RejectedOrder(side, "sma_cross", signal, bar.session, detail or "rejected"))
+                    rejected.append(RejectedOrder(side, reason, signal, bar.session, detail or "rejected"))
                 else:
                     cash += qty * fill.fill_price - fill.commission
                     trades.append(_trade(entry, fill))
                     fills.append(fill)
-                    qty, entry = 0.0, None
+                    qty, entry, entry_index = 0.0, None, None
             else:
-                rejected.append(RejectedOrder(side, "sma_cross", signal, bar.session, "position_state_mismatch"))
+                rejected.append(RejectedOrder(side, reason, signal, bar.session, "position_state_mismatch"))
             pending = None
 
         final_bar = i == len(data) - 1
@@ -464,22 +486,120 @@ def run_backtest(bars: Sequence[Bar], *, initial_capital: float, costs: CostMode
                 cash += qty * fill.fill_price - fill.commission
                 trades.append(_trade(entry, fill))
                 fills.append(fill)
-                qty, entry = 0.0, None
+                qty, entry, entry_index = 0.0, None, None
         curve.append(EquityPoint(bar.session, cash, qty, cash + qty * float(bar.close)))
-        if final_bar or i < SLOW_PERIOD:
+        if final_bar:
             continue
-        previous_fast = fmean(closes[i - FAST_PERIOD:i])
-        current_fast = fmean(closes[i - FAST_PERIOD + 1:i + 1])
-        previous_slow = fmean(closes[i - SLOW_PERIOD:i])
-        current_slow = fmean(closes[i - SLOW_PERIOD + 1:i + 1])
-        up = previous_fast <= previous_slow and current_fast > current_slow
-        down = previous_fast >= previous_slow and current_fast < current_slow
-        if qty == 0 and up:
-            pending = ("BUY", bar.session)
-        elif qty > 0 and down:
-            pending = ("SELL", bar.session)
+
+        if signal_policy is None:
+            if i < SLOW_PERIOD:
+                continue
+            previous_fast = fmean(closes[i - FAST_PERIOD:i])
+            current_fast = fmean(closes[i - FAST_PERIOD + 1:i + 1])
+            previous_slow = fmean(closes[i - SLOW_PERIOD:i])
+            current_slow = fmean(closes[i - SLOW_PERIOD + 1:i + 1])
+            up = previous_fast <= previous_slow and current_fast > current_slow
+            down = previous_fast >= previous_slow and current_fast < current_slow
+            decision = SignalDecision("BUY", "sma_cross") if qty == 0 and up else (
+                SignalDecision("SELL", "sma_cross") if qty > 0 and down else None
+            )
+        else:
+            history = prefix + data[:i + 1]
+            bars_held = i - entry_index + 1 if entry_index is not None else 0
+            decision = signal_policy(history, qty > 0, bars_held)
+            if decision is not None and not isinstance(decision, SignalDecision):
+                raise ValueError("signal policy must return SignalDecision or None")
+
+        if decision is not None:
+            if qty == 0 and decision.action == "BUY":
+                pending = (decision.action, bar.session, decision.reason)
+            elif qty > 0 and decision.action == "SELL":
+                pending = (decision.action, bar.session, decision.reason)
     return _result(initial, cash, qty, fills, rejected, trades, curve)
 
+
+def _simple_rsi(history: Sequence[Bar], period: int) -> float | None:
+    if period <= 0 or len(history) < period + 1:
+        return None
+    changes = [history[i].close - history[i - 1].close for i in range(len(history) - period, len(history))]
+    gains = fmean(max(change, 0.0) for change in changes)
+    losses = fmean(max(-change, 0.0) for change in changes)
+    if gains == 0 and losses == 0:
+        return 50.0
+    if losses == 0:
+        return 100.0
+    return 100.0 - 100.0 / (1.0 + gains / losses)
+
+
+def make_exp_strategy_policy(experiment_id: str, parameters: dict) -> SignalPolicy:
+    if experiment_id == "EXP-002":
+        entry_lookback = int(parameters["entry_lookback"])
+        exit_lookback = int(parameters["exit_lookback"])
+
+        def donchian(history: Sequence[Bar], in_position: bool, bars_held: int) -> SignalDecision | None:
+            current = history[-1]
+            if in_position:
+                if len(history) >= exit_lookback + 1:
+                    prior_lows = [bar.low for bar in history[-exit_lookback - 1:-1]]
+                    if current.close < min(prior_lows):
+                        return SignalDecision("SELL", "exp002_channel_exit")
+            elif len(history) >= entry_lookback + 1:
+                prior_highs = [bar.high for bar in history[-entry_lookback - 1:-1]]
+                if current.close > max(prior_highs):
+                    return SignalDecision("BUY", "exp002_channel_breakout")
+            return None
+
+        return donchian
+
+    if experiment_id == "EXP-003":
+        period = int(parameters["rsi_period"])
+        entry_threshold = float(parameters["entry_threshold"])
+        exit_threshold = float(parameters["exit_threshold"])
+        maximum_held_bars = int(parameters["maximum_held_bars"])
+
+        def mean_reversion(history: Sequence[Bar], in_position: bool, bars_held: int) -> SignalDecision | None:
+            value = _simple_rsi(history, period)
+            if value is None:
+                return None
+            if in_position:
+                if bars_held >= maximum_held_bars:
+                    return SignalDecision("SELL", "exp003_time_stop")
+                if value >= exit_threshold:
+                    return SignalDecision("SELL", "exp003_rsi_exit")
+            elif value <= entry_threshold:
+                return SignalDecision("BUY", "exp003_rsi_entry")
+            return None
+
+        return mean_reversion
+
+    if experiment_id == "EXP-004":
+        shock_multiple = float(parameters["shock_multiple"])
+        maximum_held_bars = int(parameters["maximum_held_bars"])
+        atr_period = 14
+
+        def volatility_shock(history: Sequence[Bar], in_position: bool, bars_held: int) -> SignalDecision | None:
+            if in_position:
+                if bars_held >= maximum_held_bars:
+                    return SignalDecision("SELL", "exp004_time_stop")
+                return None
+            prior = history[:-1]
+            if len(prior) < atr_period + 1:
+                return None
+            prior_window = prior[-atr_period:]
+            ranges = []
+            start = len(prior) - atr_period
+            for index, bar in enumerate(prior_window, start):
+                previous_close = prior[index - 1].close
+                ranges.append(max(bar.high - bar.low, abs(bar.high - previous_close), abs(bar.low - previous_close)))
+            normalized_atr = fmean(ranges) / prior[-1].close
+            positive_return = history[-1].close / prior[-1].close - 1.0
+            if positive_return >= shock_multiple * normalized_atr:
+                return SignalDecision("BUY", "exp004_volatility_shock")
+            return None
+
+        return volatility_shock
+
+    raise ValueError(f"unknown experiment strategy: {experiment_id}")
 
 def run_buy_and_hold(bars: Sequence[Bar], *, initial_capital: float, costs: CostModel,
                      constraints: QuantityConstraints) -> BacktestResult:
@@ -603,16 +723,178 @@ def run_exp001(dataset_dir: str | Path, *, initial_capital: float = 10_000.0) ->
     return output
 
 
+
+EXP003_WINDOWS = {
+    "development": (date(2018, 1, 1), date(2021, 12, 31)),
+    "validation": (date(2022, 1, 1), date(2023, 12, 31)),
+}
+EXP003_CONFIGS = {
+    "EXP-002": (
+        {"config_id": "D20_10", "entry_lookback": 20, "exit_lookback": 10},
+        {"config_id": "D55_20", "entry_lookback": 55, "exit_lookback": 20},
+        {"config_id": "D100_40", "entry_lookback": 100, "exit_lookback": 40},
+    ),
+    "EXP-003": (
+        {"config_id": "R2_05", "rsi_period": 2, "entry_threshold": 5, "exit_threshold": 50, "maximum_held_bars": 10},
+        {"config_id": "R2_10", "rsi_period": 2, "entry_threshold": 10, "exit_threshold": 50, "maximum_held_bars": 10},
+        {"config_id": "R3_10", "rsi_period": 3, "entry_threshold": 10, "exit_threshold": 50, "maximum_held_bars": 10},
+    ),
+    "EXP-004": (
+        {"config_id": "V1_3", "shock_multiple": 1.0, "maximum_held_bars": 3},
+        {"config_id": "V1_5", "shock_multiple": 1.5, "maximum_held_bars": 5},
+        {"config_id": "V2_10", "shock_multiple": 2.0, "maximum_held_bars": 10},
+    ),
+}
+EXP003_COSTS = {"base": BASE_COSTS, "stress_double_all_costs": STRESS_COSTS}
+
+
+def _result_diagnostics(result: BacktestResult) -> dict:
+    return {
+        "fill_count": len(result.fills),
+        "rejected_orders": [asdict(item) for item in result.rejected_orders],
+        "completed_trades": len(result.trades),
+        "open_quantity_at_end": result.equity_curve[-1].quantity,
+        "total_costs_usdt": result.total_costs,
+        "final_equity_usdt": result.final_capital,
+    }
+
+
+def run_trl003(dataset_dir: str | Path, *, initial_capital: float = 10_000.0) -> dict:
+    root = Path(dataset_dir)
+    loaded = load_binance_vision_klines(
+        root, start_session=date(2018, 1, 1), end_session=date(2023, 12, 31)
+    )
+    constraints = load_binance_quantity_constraints(root / "exchange_filters_snapshot.json")
+    all_bars = loaded.bars
+    dev_start, dev_end = EXP003_WINDOWS["development"]
+    val_start, val_end = EXP003_WINDOWS["validation"]
+    dev_bars = tuple(bar for bar in all_bars if dev_start.isoformat() <= bar.session <= dev_end.isoformat())
+    val_bars = tuple(bar for bar in all_bars if val_start.isoformat() <= bar.session <= val_end.isoformat())
+    if len(dev_bars) != 1461 or len(val_bars) != 730:
+        raise ValueError("TRL-003 windows do not match the frozen daily calendar")
+
+    benchmarks = {}
+    for window_name, bars, bounds in (
+        ("development", dev_bars, EXP003_WINDOWS["development"]),
+        ("validation", val_bars, EXP003_WINDOWS["validation"]),
+    ):
+        benchmarks[window_name] = {}
+        for scenario, costs in EXP003_COSTS.items():
+            benchmark = run_buy_and_hold(bars, initial_capital=initial_capital, costs=costs, constraints=constraints)
+            metrics = compute_window_metrics(benchmark, start_session=bounds[0], end_session=bounds[1])
+            benchmarks[window_name][scenario] = {
+                "metrics": asdict(metrics),
+                "diagnostics": _result_diagnostics(benchmark),
+            }
+
+    experiments = {}
+    for experiment_id, configurations in EXP003_CONFIGS.items():
+        attempted = []
+        for configuration in configurations:
+            policy = make_exp_strategy_policy(experiment_id, configuration)
+            item = {"config_id": configuration["config_id"], "parameters": configuration.copy(), "development": {}}
+            for scenario, costs in EXP003_COSTS.items():
+                result = run_backtest(
+                    dev_bars, initial_capital=initial_capital, costs=costs, constraints=constraints,
+                    signal_policy=policy,
+                )
+                metrics = compute_window_metrics(result, start_session=dev_start, end_session=dev_end)
+                item["development"][scenario] = {
+                    "metrics": asdict(metrics),
+                    "diagnostics": _result_diagnostics(result),
+                }
+            attempted.append(item)
+
+        selected = sorted(
+            attempted,
+            key=lambda item: (
+                -item["development"]["base"]["metrics"]["net_return_pct"],
+                item["development"]["base"]["metrics"]["max_drawdown_pct"],
+                item["config_id"],
+            ),
+        )[0]
+        selected_policy = make_exp_strategy_policy(experiment_id, selected["parameters"])
+        validation = {}
+        for scenario, costs in EXP003_COSTS.items():
+            result = run_backtest(
+                val_bars, initial_capital=initial_capital, costs=costs, constraints=constraints,
+                signal_policy=selected_policy, signal_history=dev_bars,
+            )
+            metrics = compute_window_metrics(result, start_session=val_start, end_session=val_end)
+            validation[scenario] = {
+                "metrics": asdict(metrics),
+                "diagnostics": _result_diagnostics(result),
+            }
+
+        base_metrics = validation["base"]["metrics"]
+        stress_metrics = validation["stress_double_all_costs"]["metrics"]
+        base_benchmark = benchmarks["validation"]["base"]["metrics"]
+        stress_benchmark = benchmarks["validation"]["stress_double_all_costs"]["metrics"]
+        gates = {
+            "at_least_30_completed_trades_in_both_cost_scenarios": (
+                base_metrics["trade_count"] >= 30 and stress_metrics["trade_count"] >= 30
+            ),
+            "base_profit_factor_gt_1": base_metrics["profit_factor"] is not None and base_metrics["profit_factor"] > 1,
+            "base_net_return_positive": base_metrics["net_return_pct"] > 0,
+            "doubled_cost_net_return_positive": stress_metrics["net_return_pct"] > 0,
+            "drawdown_below_benchmark_in_both_cost_scenarios": (
+                base_metrics["max_drawdown_pct"] < base_benchmark["max_drawdown_pct"]
+                and stress_metrics["max_drawdown_pct"] < stress_benchmark["max_drawdown_pct"]
+            ),
+        }
+        if not gates["at_least_30_completed_trades_in_both_cost_scenarios"]:
+            classification = "INCONCLUSIVE"
+        elif all(gates.values()):
+            classification = "CANDIDATA preliminare"
+        else:
+            classification = "SCARTATA"
+        experiments[experiment_id] = {
+            "selected_config_id": selected["config_id"],
+            "selection_rule": "highest development base-cost net return; tie: lower maximum drawdown, then config_id",
+            "attempted_configurations": attempted,
+            "validation_selected_configuration": validation,
+            "validation_gates": gates,
+            "classification": classification,
+        }
+
+    return {
+        "order": "TRL-003",
+        "experiments": experiments,
+        "protocol": {
+            "instrument": "BTCUSDT Spot",
+            "timeframe": "1d UTC",
+            "loaded_period": "2018-01-01 through 2023-12-31",
+            "windows": {name: [start.isoformat(), end.isoformat()] for name, (start, end) in EXP003_WINDOWS.items()},
+            "initial_capital_usdt_per_window": initial_capital,
+            "quantity_constraints": asdict(constraints),
+            "cost_scenarios_bps": {name: asdict(model) for name, model in EXP003_COSTS.items()},
+            "research_parameter_configurations": sum(len(items) for items in EXP003_CONFIGS.values()),
+            "development_scenario_evaluations": sum(len(items) for items in EXP003_CONFIGS.values()) * len(EXP003_COSTS),
+            "validation_selected_scenario_evaluations": len(EXP003_CONFIGS) * len(EXP003_COSTS),
+            "final_test_opened": False,
+            "paper_trading_started": False,
+        },
+        "data": {
+            "source": "Binance Vision Spot monthly klines",
+            "archive_count_loaded": loaded.archive_count,
+            "rows_loaded": len(all_bars),
+            "download_manifest_sha256": loaded.manifest_sha256,
+        },
+        "engine_sha256": _sha256_file(Path(__file__)),
+        "benchmarks": benchmarks,
+    }
+
 def main():
-    parser = argparse.ArgumentParser(description="Run the frozen BTCUSDT EXP-001 evaluation.")
+    parser = argparse.ArgumentParser(description="Run BTCUSDT historical research with the deterministic daily-bar engine.")
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--experiment", choices=("EXP-001", "TRL-003"), default="EXP-001")
     args = parser.parse_args()
-    result = run_exp001(args.dataset_dir)
+    result = run_exp001(args.dataset_dir) if args.experiment == "EXP-001" else run_trl003(args.dataset_dir)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    print(f"Saved local EXP-001 results to {output_path}")
+    print(f"Saved local {args.experiment} results to {output_path}")
 
 
 if __name__ == "__main__":

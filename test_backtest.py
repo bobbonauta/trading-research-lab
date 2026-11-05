@@ -1,4 +1,4 @@
-"""Synthetic checks for EXP-001 ingestion, accounting, and window metrics."""
+"""Synthetic checks for data ingestion, accounting, metrics, and causal strategy rules."""
 import csv
 import hashlib
 import io
@@ -13,9 +13,11 @@ from backtest import (
     Bar,
     CostModel,
     QuantityConstraints,
+    SignalDecision,
     compute_window_metrics,
     load_binance_quantity_constraints,
     load_binance_vision_klines,
+    make_exp_strategy_policy,
     parse_binance_kline_row,
     run_backtest,
     run_buy_and_hold,
@@ -273,6 +275,101 @@ class BacktestTests(unittest.TestCase):
             self.assertEqual(rules.step_size, 0.00001)
             self.assertEqual(rules.max_quantity, 125.26150288)
             self.assertEqual(rules.min_notional, 5)
+
+
+    def test_donchian_entry_and_exit_use_prior_completed_channel(self):
+        policy = make_exp_strategy_policy("EXP-002", {"entry_lookback": 3, "exit_lookback": 2})
+        breakout = make_bars([100, 100, 100, 102])
+        self.assertEqual(policy(breakout, False, 0), SignalDecision("BUY", "exp002_channel_breakout"))
+        current_bar_not_in_channel = make_bars([100, 110, 100, 105])
+        self.assertIsNone(policy(current_bar_not_in_channel, False, 0))
+        breakdown = make_bars([100, 100, 100, 90])
+        self.assertEqual(policy(breakdown, True, 1), SignalDecision("SELL", "exp002_channel_exit"))
+
+    def test_rsi_mean_reversion_exit_and_time_stop(self):
+        policy = make_exp_strategy_policy("EXP-003", {
+            "rsi_period": 2, "entry_threshold": 10, "exit_threshold": 50, "maximum_held_bars": 10,
+        })
+        oversold = make_bars([100, 99, 98])
+        self.assertEqual(policy(oversold, False, 0), SignalDecision("BUY", "exp003_rsi_entry"))
+        rebound = make_bars([100, 99, 98, 99, 100])
+        self.assertEqual(policy(rebound, True, 1), SignalDecision("SELL", "exp003_rsi_exit"))
+        self.assertEqual(policy(oversold, True, 10), SignalDecision("SELL", "exp003_time_stop"))
+
+    def test_volatility_shock_uses_only_prior_true_ranges(self):
+        policy = make_exp_strategy_policy("EXP-004", {"shock_multiple": 1.5, "maximum_held_bars": 2})
+        bars = make_bars([100] * 15 + [103])
+        last = bars[-1]
+        bars[-1] = Bar(last.session, 100, 200, 99, 103)
+        self.assertEqual(policy(bars, False, 0), SignalDecision("BUY", "exp004_volatility_shock"))
+
+    def test_strategy_policy_executes_next_open_and_receives_only_causal_history(self):
+        closes = [100, 110, 110, 90, 95]
+        opens = closes.copy()
+        opens[2], opens[4] = 150, 80
+        bars = make_bars(closes, opens)
+        observed_history_ends = []
+
+        def policy(history, in_position, bars_held):
+            observed_history_ends.append(history[-1].session)
+            current = history[-1].close
+            if not in_position and current > 105:
+                return SignalDecision("BUY", "exp002_channel_breakout")
+            if in_position and current < 95:
+                return SignalDecision("SELL", "exp002_channel_exit")
+            return None
+
+        result = run_backtest(
+            bars, initial_capital=10_000, costs=ZERO_COSTS,
+            constraints=QuantityConstraints(1, 1, 1_000, 0), signal_policy=policy,
+        )
+        buy, sell = result.fills
+        self.assertEqual((buy.signal_session, buy.fill_session, buy.reference_price),
+                         (bars[1].session, bars[2].session, 150))
+        self.assertEqual((sell.signal_session, sell.fill_session, sell.reference_price),
+                         (bars[3].session, bars[4].session, 80))
+        self.assertEqual(observed_history_ends, [bar.session for bar in bars[:-1]])
+
+    def test_validation_policy_can_use_only_prior_warmup_without_carrying_position(self):
+        all_bars = make_bars([100, 101, 102, 104, 105])
+        history, validation = all_bars[:3], all_bars[3:]
+        policy = make_exp_strategy_policy("EXP-002", {"entry_lookback": 3, "exit_lookback": 2})
+        result = run_backtest(
+            validation, initial_capital=10_000, costs=ZERO_COSTS,
+            constraints=QuantityConstraints(1, 1, 1_000, 0), signal_policy=policy, signal_history=history,
+        )
+        buy = next(fill for fill in result.fills if fill.side == "BUY")
+        self.assertEqual(buy.signal_session, validation[0].session)
+        self.assertEqual(buy.fill_session, validation[1].session)
+        self.assertEqual(result.equity_curve[0].quantity, 0)
+
+    def test_volatility_policy_time_stop_uses_completed_holding_bars(self):
+        closes = [100] * 15 + [103, 104, 105, 106]
+        opens = closes.copy()
+        opens[16], opens[18] = 110, 90
+        bars = make_bars(closes, opens)
+        policy = make_exp_strategy_policy("EXP-004", {"shock_multiple": 1.5, "maximum_held_bars": 2})
+        result = run_backtest(
+            bars, initial_capital=10_000, costs=ZERO_COSTS,
+            constraints=QuantityConstraints(1, 1, 1_000, 0), signal_policy=policy,
+        )
+        buy, sell = result.fills
+        self.assertEqual((buy.signal_session, buy.fill_session, buy.reference_price),
+                         (bars[15].session, bars[16].session, 110))
+        self.assertEqual((sell.signal_session, sell.fill_session, sell.reference_price, sell.reason),
+                         (bars[17].session, bars[18].session, 90, "exp004_time_stop"))
+
+    def test_monthly_loader_ignores_unrequested_archives_for_frozen_subperiods(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_fixture_dataset(root, [make_kline_row(date(2025, 1, 1), unit=1_000_000)])
+            (root / "BTCUSDT-1d-2025-02.zip").write_bytes(b"not opened by the requested-period loader")
+            loaded = load_binance_vision_klines(
+                root, start_session=date(2025, 1, 1), end_session=date(2025, 1, 1)
+            )
+            self.assertEqual(len(loaded.bars), 1)
+            self.assertEqual(loaded.bars[0].session, "2025-01-01")
+            self.assertEqual(loaded.archive_count, 1)
 
 
 if __name__ == "__main__":
