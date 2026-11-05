@@ -8,7 +8,7 @@ import io
 import json
 import zipfile
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from math import fsum, isfinite
 from statistics import fmean
@@ -18,7 +18,7 @@ from typing import Callable, Literal, Sequence
 FAST_PERIOD = 20
 SLOW_PERIOD = 100
 Side = Literal["BUY", "SELL"]
-Reason = Literal["sma_cross", "end_of_test", "benchmark", "exp002_channel_breakout", "exp002_channel_exit", "exp003_rsi_entry", "exp003_rsi_exit", "exp003_time_stop", "exp004_volatility_shock", "exp004_time_stop"]
+Reason = Literal["sma_cross", "end_of_test", "benchmark", "exp002_channel_breakout", "exp002_channel_exit", "exp003_rsi_entry", "exp003_rsi_exit", "exp003_time_stop", "exp004_volatility_shock", "exp004_time_stop", "exp005_compression_breakout", "exp005_trailing_exit", "exp005_time_stop", "exp006_capitulation_entry", "exp006_reversion_exit", "exp006_time_stop"]
 TIMESTAMP_SWITCH_DATE = date(2025, 1, 1)
 DEFAULT_START = date(2018, 1, 1)
 DEFAULT_END = date(2025, 12, 31)
@@ -31,6 +31,8 @@ class Bar:
     high: float
     low: float
     close: float
+    quote_volume: float | None = None
+    close_time: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,41 @@ class WindowMetrics:
     total_costs_usdt: float
 
 
+def _format_utc_timestamp(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("timestamp must be timezone-aware UTC")
+    value = value.astimezone(timezone.utc)
+    if value.microsecond == 0:
+        precision = "seconds"
+    elif value.microsecond % 1000 == 0:
+        precision = "milliseconds"
+    else:
+        precision = "microseconds"
+    return value.isoformat(timespec=precision).replace("+00:00", "Z")
+
+
+def _bar_datetime(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("bar timestamp must be a string")
+    if len(value) == 10:
+        try:
+            parsed_date = date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("bar has invalid ISO session date") from exc
+        if parsed_date.isoformat() != value:
+            raise ValueError("daily bar session must use YYYY-MM-DD")
+        return datetime.combine(parsed_date, time.min, tzinfo=timezone.utc)
+    if not value.endswith("Z"):
+        raise ValueError("intraday bar timestamp must be explicit UTC ending in Z")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError("bar has invalid ISO UTC timestamp") from exc
+    if _format_utc_timestamp(parsed) != value:
+        raise ValueError("intraday bar timestamp is not canonical UTC")
+    return parsed
+
+
 def _validate_bars(bars: Sequence[Bar]) -> tuple[Bar, ...]:
     data = tuple(bars)
     if not data:
@@ -164,11 +201,9 @@ def _validate_bars(bars: Sequence[Bar]) -> tuple[Bar, ...]:
         if not isinstance(bar, Bar):
             raise ValueError(f"bar {index} is not a Bar")
         try:
-            parsed = date.fromisoformat(bar.session)
+            parsed = _bar_datetime(bar.session)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"bar {index} has invalid ISO session date") from exc
-        if parsed.isoformat() != bar.session:
-            raise ValueError(f"bar {index} session must use YYYY-MM-DD")
+            raise ValueError(f"bar {index} has invalid ISO UTC timestamp") from exc
         if previous is not None and parsed <= previous:
             raise ValueError("bar sessions must be strictly increasing")
         previous = parsed
@@ -177,6 +212,17 @@ def _validate_bars(bars: Sequence[Bar]) -> tuple[Bar, ...]:
             raise ValueError(f"bar {index} has missing, non-finite, or non-positive OHLC")
         if bar.high < max(bar.open, bar.close) or bar.low > min(bar.open, bar.close) or bar.high < bar.low:
             raise ValueError(f"bar {index} has inconsistent OHLC values")
+        if bar.quote_volume is not None and (
+            not isinstance(bar.quote_volume, (int, float)) or not isfinite(bar.quote_volume) or bar.quote_volume < 0
+        ):
+            raise ValueError(f"bar {index} has invalid quote volume")
+        if bar.close_time is not None:
+            try:
+                closed = _bar_datetime(bar.close_time)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"bar {index} has invalid close timestamp") from exc
+            if closed <= parsed:
+                raise ValueError(f"bar {index} close timestamp must follow its open timestamp")
     return data
 
 
@@ -193,22 +239,37 @@ def _timestamp(value: str, label: str) -> tuple[datetime, int, int]:
     return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(microsecond=micros), unit, ts
 
 
-def parse_binance_kline_row(row: Sequence[str], *, source: str = "kline") -> tuple[Bar, int]:
+INTERVAL_SECONDS = {"1d": 86_400, "4h": 14_400}
+
+
+def parse_binance_kline_row(
+    row: Sequence[str], *, source: str = "kline", interval: str = "1d"
+) -> tuple[Bar, int]:
+    if interval not in INTERVAL_SECONDS:
+        raise ValueError(f"{source}: unsupported kline interval {interval}")
     if len(row) != 12:
         raise ValueError(f"{source}: expected 12 CSV columns, found {len(row)}")
     opened, unit, open_ts = _timestamp(row[0], f"{source} open time")
-    _, close_unit, close_ts = _timestamp(row[6], f"{source} close time")
-    if close_unit != unit or close_ts != open_ts + 86_400 * unit - 1:
-        raise ValueError(f"{source}: close time does not match a 24-hour UTC candle")
-    if opened.hour or opened.minute or opened.second or opened.microsecond:
-        raise ValueError(f"{source}: daily open is not midnight UTC")
-    session = opened.date()
-    if (unit == 1_000_000) != (session >= TIMESTAMP_SWITCH_DATE):
+    closed, close_unit, close_ts = _timestamp(row[6], f"{source} close time")
+    if close_unit != unit or close_ts != open_ts + INTERVAL_SECONDS[interval] * unit - 1:
+        raise ValueError(f"{source}: close time does not match a {interval} UTC candle")
+    if (unit == 1_000_000) != (opened.date() >= TIMESTAMP_SWITCH_DATE):
         raise ValueError(f"{source}: timestamp unit disagrees with Binance's 2025 change")
+    if interval == "1d":
+        if opened.hour or opened.minute or opened.second or opened.microsecond:
+            raise ValueError(f"{source}: daily open is not midnight UTC")
+        session = opened.date().isoformat()
+        close_time = None
+    else:
+        if opened.hour % 4 or opened.minute or opened.second or opened.microsecond:
+            raise ValueError(f"{source}: 4h open is not aligned to the UTC four-hour grid")
+        session = _format_utc_timestamp(opened)
+        close_time = _format_utc_timestamp(closed)
     try:
         values = [Decimal(value) for value in row]
         o, h, low, c = values[1:5]
-        volumes = (values[5], values[7], values[9], values[10])
+        base_volume, quote_volume = values[5], values[7]
+        checked_volumes = (values[5], values[7], values[9], values[10])
         trade_count = int(row[8])
     except (InvalidOperation, ValueError) as exc:
         raise ValueError(f"{source}: malformed numeric field") from exc
@@ -216,33 +277,48 @@ def parse_binance_kline_row(row: Sequence[str], *, source: str = "kline") -> tup
         raise ValueError(f"{source}: OHLC must be finite and positive")
     if h < max(o, c) or low > min(o, c) or h < low:
         raise ValueError(f"{source}: inconsistent OHLC")
-    if any(not v.is_finite() or v < 0 for v in volumes) or trade_count < 0:
+    if any(not v.is_finite() or v < 0 for v in checked_volumes) or trade_count < 0:
         raise ValueError(f"{source}: invalid volume or trade count")
-    return Bar(session.isoformat(), float(o), float(h), float(low), float(c)), unit
+    return Bar(session, float(o), float(h), float(low), float(c), float(quote_volume), close_time), unit
 
 
-def _month_names(start: date, end: date, *, symbol: str = "BTCUSDT") -> tuple[str, ...]:
+def _month_names(
+    start: date, end: date, *, symbol: str = "BTCUSDT", interval: str = "1d"
+) -> tuple[str, ...]:
     if start > end:
         raise ValueError("start date must not follow end date")
     if not symbol or not symbol.isalnum():
         raise ValueError("symbol must contain only letters and digits")
+    if interval not in INTERVAL_SECONDS:
+        raise ValueError(f"unsupported kline interval {interval}")
     names = []
     year, month = start.year, start.month
     while (year, month) <= (end.year, end.month):
-        names.append(f"{symbol}-1d-{year:04d}-{month:02d}.zip")
+        names.append(f"{symbol}-{interval}-{year:04d}-{month:02d}.zip")
         if month == 12:
             year, month = year + 1, 1
         else:
             month += 1
     return tuple(names)
 
-def _expected_sessions(start: date, end: date) -> tuple[str, ...]:
+
+def _expected_bar_opens(start: date, end: date, interval: str) -> tuple[str, ...]:
+    if start > end:
+        raise ValueError("start date must not follow end date")
+    if interval not in INTERVAL_SECONDS:
+        raise ValueError(f"unsupported kline interval {interval}")
+    step = timedelta(seconds=INTERVAL_SECONDS[interval])
+    current = datetime.combine(start, time.min, tzinfo=timezone.utc)
+    final_open = datetime.combine(end + timedelta(days=1), time.min, tzinfo=timezone.utc) - step
     result = []
-    current = start
-    while current <= end:
-        result.append(current.isoformat())
-        current += timedelta(days=1)
+    while current <= final_open:
+        result.append(current.date().isoformat() if interval == "1d" else _format_utc_timestamp(current))
+        current += step
     return tuple(result)
+
+
+def _expected_sessions(start: date, end: date) -> tuple[str, ...]:
+    return _expected_bar_opens(start, end, "1d")
 
 
 def _sha256_file(path: Path) -> str:
@@ -255,7 +331,7 @@ def _sha256_file(path: Path) -> str:
 
 def load_binance_vision_klines(
     dataset_dir: str | Path, *, start_session: date = DEFAULT_START, end_session: date = DEFAULT_END,
-    symbol: str = "BTCUSDT",
+    symbol: str = "BTCUSDT", interval: str = "1d",
 ) -> LoadedDataset:
     root = Path(dataset_dir)
     manifest_path = root / "download_manifest.json"
@@ -265,8 +341,8 @@ def load_binance_vision_klines(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("dataset manifest is unreadable") from exc
-    expected_files = _month_names(start_session, end_session, symbol=symbol)
-    actual_files = {p.name for p in root.glob(f"{symbol}-1d-????-??.zip")}
+    expected_files = _month_names(start_session, end_session, symbol=symbol, interval=interval)
+    actual_files = {p.name for p in root.glob(f"{symbol}-{interval}-????-??.zip")}
     if not set(expected_files).issubset(actual_files):
         raise ValueError("monthly archive set is missing files for requested period")
     records = manifest.get("archives")
@@ -299,16 +375,17 @@ def load_binance_vision_klines(
                 with archive.open(csv_name, "r") as binary:
                     reader = csv.reader(io.TextIOWrapper(binary, encoding="utf-8", newline=""))
                     for row_no, row in enumerate(reader, 1):
-                        bar, unit = parse_binance_kline_row(row, source=f"{name}:{row_no}")
-                        if start_session.isoformat() <= bar.session <= end_session.isoformat():
+                        bar, unit = parse_binance_kline_row(row, source=f"{name}:{row_no}", interval=interval)
+                        if start_session.isoformat() <= bar.session[:10] <= end_session.isoformat():
                             bars.append(bar)
                             units.append(unit)
         except (OSError, zipfile.BadZipFile, UnicodeError) as exc:
             raise ValueError(f"cannot read archive {name}") from exc
 
     data = _validate_bars(bars)
-    if tuple(b.session for b in data) != _expected_sessions(start_session, end_session):
-        raise ValueError("daily UTC session grid has duplicates or missing days")
+    if tuple(b.session for b in data) != _expected_bar_opens(start_session, end_session, interval):
+        label = "daily" if interval == "1d" else interval
+        raise ValueError(f"{label} UTC session grid has duplicates or missing bars")
     return LoadedDataset(
         data, len(expected_files), units.count(1_000), units.count(1_000_000), _sha256_file(manifest_path)
     )
@@ -481,7 +558,7 @@ def run_backtest(
 
         final_bar = i == len(data) - 1
         if final_bar and qty > 0 and entry is not None:
-            fill, detail = _sell(qty, entry, float(bar.close), bar.session, None, "end_of_test", costs, constraints)
+            fill, detail = _sell(qty, entry, float(bar.close), bar.close_time or bar.session, None, "end_of_test", costs, constraints)
             if fill is None:
                 rejected.append(RejectedOrder("SELL", "end_of_test", None, bar.session, detail or "rejected"))
             else:
@@ -531,6 +608,19 @@ def _simple_rsi(history: Sequence[Bar], period: int) -> float | None:
     if losses == 0:
         return 100.0
     return 100.0 - 100.0 / (1.0 + gains / losses)
+
+
+def _true_range_at(history: Sequence[Bar], index: int) -> float:
+    if index <= 0 or index >= len(history):
+        raise ValueError("true range requires a bar and its prior close")
+    bar, previous = history[index], history[index - 1]
+    return max(bar.high - bar.low, abs(bar.high - previous.close), abs(bar.low - previous.close))
+
+
+def _mean_quote_volume(bars: Sequence[Bar]) -> float | None:
+    if not bars or any(bar.quote_volume is None for bar in bars):
+        return None
+    return fmean(float(bar.quote_volume) for bar in bars)
 
 
 def make_exp_strategy_policy(experiment_id: str, parameters: dict) -> SignalPolicy:
@@ -601,6 +691,70 @@ def make_exp_strategy_policy(experiment_id: str, parameters: dict) -> SignalPoli
 
         return volatility_shock
 
+    if experiment_id == "EXP-005":
+        breakout_lookback = int(parameters["breakout_lookback"])
+        if breakout_lookback not in (12, 24):
+            raise ValueError("EXP-005 breakout_lookback must be 12 or 24")
+
+        def compression_breakout(history: Sequence[Bar], in_position: bool, bars_held: int) -> SignalDecision | None:
+            index = len(history) - 1
+            current = history[-1]
+            if in_position:
+                if bars_held >= 18:
+                    return SignalDecision("SELL", "exp005_time_stop")
+                if index >= 6 and current.close < min(bar.low for bar in history[index - 6:index]):
+                    return SignalDecision("SELL", "exp005_trailing_exit")
+                return None
+            if index < 31 or current.quote_volume is None:
+                return None
+            short_ranges = [_true_range_at(history, i) for i in range(index - 6, index)]
+            reference_ranges = [_true_range_at(history, i) for i in range(index - 30, index - 6)]
+            reference_mean = fmean(reference_ranges)
+            if reference_mean <= 0:
+                return None
+            prior_volumes = _mean_quote_volume(history[index - 24:index])
+            if prior_volumes is None or prior_volumes <= 0:
+                return None
+            prior_highs = [bar.high for bar in history[index - breakout_lookback:index]]
+            if (
+                fmean(short_ranges) <= 0.65 * reference_mean
+                and current.close > max(prior_highs)
+                and current.quote_volume >= 1.25 * prior_volumes
+            ):
+                return SignalDecision("BUY", "exp005_compression_breakout")
+            return None
+
+        return compression_breakout
+
+    if experiment_id == "EXP-006":
+        shock_multiple = float(parameters["shock_multiple"])
+        if shock_multiple not in (2.0, 2.5):
+            raise ValueError("EXP-006 shock_multiple must be 2.0 or 2.5")
+
+        def high_volume_shock_reversal(history: Sequence[Bar], in_position: bool, bars_held: int) -> SignalDecision | None:
+            index = len(history) - 1
+            current = history[-1]
+            if in_position:
+                if bars_held >= 12:
+                    return SignalDecision("SELL", "exp006_time_stop")
+                if index >= 6 and current.close >= fmean(bar.close for bar in history[index - 6:index]):
+                    return SignalDecision("SELL", "exp006_reversion_exit")
+                return None
+            if index < 25 or current.quote_volume is None:
+                return None
+            previous_close = history[index - 1].close
+            prior_ranges = [_true_range_at(history, i) for i in range(index - 24, index)]
+            prior_volumes = _mean_quote_volume(history[index - 24:index])
+            if prior_volumes is None or prior_volumes <= 0:
+                return None
+            negative_return = current.close / previous_close - 1.0
+            normalized_range = fmean(prior_ranges) / previous_close
+            if negative_return <= -shock_multiple * normalized_range and current.quote_volume >= 2.0 * prior_volumes:
+                return SignalDecision("BUY", "exp006_capitulation_entry")
+            return None
+
+        return high_volume_shock_reversal
+
     raise ValueError(f"unknown experiment strategy: {experiment_id}")
 
 def run_buy_and_hold(bars: Sequence[Bar], *, initial_capital: float, costs: CostModel,
@@ -621,7 +775,7 @@ def run_buy_and_hold(bars: Sequence[Bar], *, initial_capital: float, costs: Cost
                 qty, entry = fill.quantity, fill
                 fills.append(fill)
         if i == len(data) - 1 and qty > 0 and entry is not None:
-            fill, detail = _sell(qty, entry, float(bar.close), bar.session, None, "end_of_test", costs, constraints)
+            fill, detail = _sell(qty, entry, float(bar.close), bar.close_time or bar.session, None, "end_of_test", costs, constraints)
             if fill is None:
                 rejected.append(RejectedOrder("SELL", "end_of_test", None, bar.session, detail or "rejected"))
             else:
@@ -636,10 +790,17 @@ def run_buy_and_hold(bars: Sequence[Bar], *, initial_capital: float, costs: Cost
 def compute_window_metrics(result: BacktestResult, *, start_session: date, end_session: date) -> WindowMetrics:
     if start_session > end_session:
         raise ValueError("window start must not follow end")
-    points = [p for p in result.equity_curve if start_session.isoformat() <= p.session <= end_session.isoformat()]
+    start_dt = datetime.combine(start_session, time.min, tzinfo=timezone.utc)
+    end_exclusive = datetime.combine(end_session + timedelta(days=1), time.min, tzinfo=timezone.utc)
+
+    def in_window(timestamp: str) -> bool:
+        value = _bar_datetime(timestamp)
+        return start_dt <= value < end_exclusive
+
+    points = [p for p in result.equity_curve if in_window(p.session)]
     if not points:
         raise ValueError("window has no equity points")
-    prior = [p for p in result.equity_curve if p.session < start_session.isoformat()]
+    prior = [p for p in result.equity_curve if _bar_datetime(p.session) < start_dt]
     start_equity = prior[-1].equity if prior else result.initial_capital
     final_equity = points[-1].equity
     peak, drawdown = start_equity, 0.0
@@ -647,10 +808,10 @@ def compute_window_metrics(result: BacktestResult, *, start_session: date, end_s
         peak = max(peak, point.equity)
         if peak > 0:
             drawdown = max(drawdown, (peak - point.equity) / peak)
-    trades = [t for t in result.trades if start_session.isoformat() <= t.exit.fill_session <= end_session.isoformat()]
+    trades = [t for t in result.trades if in_window(t.exit.fill_session)]
     wins = [t.net_pnl for t in trades if t.net_pnl > 0]
     losses = [t.net_pnl for t in trades if t.net_pnl < 0]
-    fills = [f for f in result.fills if start_session.isoformat() <= f.fill_session <= end_session.isoformat()]
+    fills = [f for f in result.fills if in_window(f.fill_session)]
     return WindowMetrics(
         start_session.isoformat(), end_session.isoformat(), start_equity, final_equity,
         100 * (final_equity / start_equity - 1), 100 * drawdown, len(trades),
@@ -1055,18 +1216,385 @@ def run_trl004(dataset_dir: str | Path, *, initial_capital: float = 10_000.0) ->
         "benchmarks": benchmarks,
     }
 
+TRL005_WINDOWS = {
+    "development": (date(2018, 1, 1), date(2021, 12, 31), 8766),
+    "validation": (date(2022, 1, 1), date(2023, 12, 31), 4380),
+}
+TRL005_STRATEGIES = {
+    "EXP-005": {
+        "title": "Volatility-compression breakout continuation",
+        "configs": (
+            {"config_id": "C12", "parameters": {"breakout_lookback": 12}},
+            {"config_id": "C24", "parameters": {"breakout_lookback": 24}},
+        ),
+    },
+    "EXP-006": {
+        "title": "High-volume negative-shock reversal",
+        "configs": (
+            {"config_id": "S20", "parameters": {"shock_multiple": 2.0}},
+            {"config_id": "S25", "parameters": {"shock_multiple": 2.5}},
+        ),
+    },
+}
+TRL005_COSTS = {"base": BASE_COSTS, "stress_double_all_costs": STRESS_COSTS}
+
+
+def _trade_duration_summary(result: BacktestResult) -> dict:
+    hours = []
+    bars = []
+    for trade in result.trades:
+        start = _bar_datetime(trade.entry.fill_session)
+        end = _bar_datetime(trade.exit.fill_session)
+        duration_hours = max(0.0, (end - start).total_seconds() / 3600)
+        hours.append(duration_hours)
+        bars.append(int(round(duration_hours / 4)))
+    if not bars:
+        return {
+            "trade_count": 0, "min_bars": None, "median_bars": None, "mean_bars": None, "max_bars": None,
+            "min_hours": None, "median_hours": None, "mean_hours": None, "max_hours": None,
+        }
+    sorted_bars, sorted_hours = sorted(bars), sorted(hours)
+    return {
+        "trade_count": len(bars),
+        "min_bars": min(bars),
+        "median_bars": _linear_quantile(sorted_bars, 0.5),
+        "mean_bars": fsum(bars) / len(bars),
+        "max_bars": max(bars),
+        "min_hours": min(hours),
+        "median_hours": _linear_quantile(sorted_hours, 0.5),
+        "mean_hours": fsum(hours) / len(hours),
+        "max_hours": max(hours),
+    }
+
+
+def _trl005_run_record(result: BacktestResult, metrics: WindowMetrics) -> dict:
+    return {
+        "metrics": asdict(metrics),
+        "diagnostics": _result_diagnostics(result),
+        "trade_distribution": _trade_distribution(result),
+        "trade_duration": _trade_duration_summary(result),
+        "trade_records": [asdict(trade) for trade in result.trades],
+    }
+
+
+def _trl005_cash_reference(initial_capital: float) -> dict:
+    return {
+        "initial_capital_usdt": initial_capital,
+        "final_equity_usdt": initial_capital,
+        "net_return_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+        "total_costs_usdt": 0.0,
+        "trade_count": 0,
+    }
+
+
+def _trl005_development_gates(base_metrics: dict, stress_metrics: dict, benchmark_base: dict) -> dict:
+    gates = {
+        "at_least_30_completed_trades_in_both_cost_scenarios": (
+            base_metrics["trade_count"] >= 30 and stress_metrics["trade_count"] >= 30
+        ),
+        "positive_net_return_in_both_cost_scenarios": (
+            base_metrics["net_return_pct"] > 0 and stress_metrics["net_return_pct"] > 0
+        ),
+        "base_profit_factor_gt_1": (
+            base_metrics["profit_factor"] is not None and base_metrics["profit_factor"] > 1
+        ),
+        "base_drawdown_below_base_buy_and_hold": (
+            base_metrics["max_drawdown_pct"] < benchmark_base["max_drawdown_pct"]
+        ),
+    }
+    gates["eligible_for_validation"] = all(gates.values())
+    return gates
+
+
+def _trl005_choose_development_config(configurations: dict, benchmark_base: dict) -> tuple[str | None, dict]:
+    eligible = []
+    gate_results = {}
+    for config_id, configuration in configurations.items():
+        base = configuration["cost_scenarios"]["base"]["metrics"]
+        stress = configuration["cost_scenarios"]["stress_double_all_costs"]["metrics"]
+        gates = _trl005_development_gates(base, stress, benchmark_base)
+        gate_results[config_id] = gates
+        if gates["eligible_for_validation"]:
+            eligible.append(config_id)
+    if not eligible:
+        return None, {"eligible_config_ids": [], "selected_config_id": None, "reason": "no configuration passed all predeclared development gates", "gates_by_config": gate_results}
+    selected = sorted(
+        eligible,
+        key=lambda config_id: (
+            -configurations[config_id]["cost_scenarios"]["stress_double_all_costs"]["metrics"]["net_return_pct"],
+            configurations[config_id]["cost_scenarios"]["stress_double_all_costs"]["metrics"]["max_drawdown_pct"],
+            config_id,
+        ),
+    )[0]
+    return selected, {
+        "eligible_config_ids": eligible,
+        "selected_config_id": selected,
+        "reason": "highest stress-cost net return; ties resolved by lower stress drawdown, then config ID",
+        "gates_by_config": gate_results,
+    }
+
+
+def run_trl005_development(dataset_dir: str | Path, *, initial_capital: float = 10_000.0) -> dict:
+    root = Path(dataset_dir)
+    start, end, expected_rows = TRL005_WINDOWS["development"]
+    loaded = load_binance_vision_klines(
+        root, start_session=start, end_session=end, symbol="BTCUSDT", interval="4h"
+    )
+    if len(loaded.bars) != expected_rows:
+        raise ValueError("TRL-005 development calendar count mismatch")
+    constraints_path = root.parent / "1d" / "exchange_filters_snapshot.json"
+    constraints = load_binance_quantity_constraints(constraints_path, symbol="BTCUSDT")
+    benchmarks = {}
+    for scenario, costs in TRL005_COSTS.items():
+        result = run_buy_and_hold(loaded.bars, initial_capital=initial_capital, costs=costs, constraints=constraints)
+        metrics = compute_window_metrics(result, start_session=start, end_session=end)
+        benchmarks[scenario] = {"metrics": asdict(metrics), "diagnostics": _result_diagnostics(result)}
+
+    experiments = {}
+    selected_for_validation = []
+    for experiment_id, spec in TRL005_STRATEGIES.items():
+        configurations = {}
+        for frozen in spec["configs"]:
+            config_id = frozen["config_id"]
+            policy = make_exp_strategy_policy(experiment_id, frozen["parameters"])
+            cost_scenarios = {}
+            for scenario, costs in TRL005_COSTS.items():
+                result = run_backtest(
+                    loaded.bars, initial_capital=initial_capital, costs=costs,
+                    constraints=constraints, signal_policy=policy,
+                )
+                metrics = compute_window_metrics(result, start_session=start, end_session=end)
+                cost_scenarios[scenario] = _trl005_run_record(result, metrics)
+            configurations[config_id] = {
+                "parameters": frozen["parameters"],
+                "cost_scenarios": cost_scenarios,
+            }
+        selected, decision = _trl005_choose_development_config(
+            configurations, benchmarks["base"]["metrics"]
+        )
+        if selected is not None:
+            selected_for_validation.append({"experiment_id": experiment_id, "config_id": selected})
+        experiments[experiment_id] = {
+            "title": spec["title"],
+            "configurations": configurations,
+            "development_selection": decision,
+        }
+
+    return {
+        "order": "TRL-005",
+        "phase": "development",
+        "market": "BTCUSDT Spot",
+        "interval": "4h UTC",
+        "data": {
+            "source": "Binance Vision Spot monthly klines",
+            "symbol": "BTCUSDT",
+            "interval": "4h",
+            "period": "2018-01-01 through 2021-12-31",
+            "archive_count_loaded": loaded.archive_count,
+            "rows_loaded": len(loaded.bars),
+            "milliseconds_rows": loaded.milliseconds_rows,
+            "microseconds_rows": loaded.microseconds_rows,
+            "download_manifest_sha256": loaded.manifest_sha256,
+        },
+        "initial_capital_usdt": initial_capital,
+        "quantity_constraints": asdict(constraints),
+        "cost_scenarios_bps": {name: asdict(model) for name, model in TRL005_COSTS.items()},
+        "configuration_count_tested": sum(len(item["configs"]) for item in TRL005_STRATEGIES.values()),
+        "strategy_runs": 8,
+        "benchmark_runs": 2,
+        "benchmarks": benchmarks,
+        "cash_reference": _trl005_cash_reference(initial_capital),
+        "experiments": experiments,
+        "selected_for_validation": selected_for_validation,
+        "validation_opened": False,
+        "final_test_opened": False,
+        "paper_trading_started": False,
+        "engine_sha256": _sha256_file(Path(__file__)),
+    }
+
+
+def _trl005_recompute_selected(development: dict) -> list[dict]:
+    if development.get("order") != "TRL-005" or development.get("phase") != "development":
+        raise ValueError("validation requires a TRL-005 development result")
+    benchmark_base = development["benchmarks"]["base"]["metrics"]
+    selected = []
+    for experiment_id, experiment in development["experiments"].items():
+        choice, decision = _trl005_choose_development_config(
+            experiment["configurations"], benchmark_base
+        )
+        if decision != experiment["development_selection"]:
+            raise ValueError(f"development selection record does not reconcile for {experiment_id}")
+        if choice is not None:
+            selected.append({"experiment_id": experiment_id, "config_id": choice})
+    if selected != development.get("selected_for_validation"):
+        raise ValueError("development selected-config list does not reconcile")
+    return selected
+
+
+def _trl005_validation_gates(base_metrics: dict, stress_metrics: dict, benchmark_base: dict, benchmark_stress: dict) -> dict:
+    gates = {
+        "at_least_30_completed_trades_in_both_cost_scenarios": (
+            base_metrics["trade_count"] >= 30 and stress_metrics["trade_count"] >= 30
+        ),
+        "positive_net_return_in_both_cost_scenarios": (
+            base_metrics["net_return_pct"] > 0 and stress_metrics["net_return_pct"] > 0
+        ),
+        "profit_factor_gt_1_in_both_cost_scenarios": (
+            base_metrics["profit_factor"] is not None and base_metrics["profit_factor"] > 1
+            and stress_metrics["profit_factor"] is not None and stress_metrics["profit_factor"] > 1
+        ),
+        "drawdown_below_buy_and_hold_in_both_cost_scenarios": (
+            base_metrics["max_drawdown_pct"] < benchmark_base["max_drawdown_pct"]
+            and stress_metrics["max_drawdown_pct"] < benchmark_stress["max_drawdown_pct"]
+        ),
+    }
+    if not gates["at_least_30_completed_trades_in_both_cost_scenarios"]:
+        classification = "INCONCLUSIVE"
+    elif all(gates.values()):
+        classification = "PRELIMINARY_HISTORICALLY_FAVORABLE"
+    else:
+        classification = "SCARTATA"
+    return {"gates": gates, "classification": classification}
+
+
+def run_trl005_validation(
+    dataset_dir: str | Path, development_result_path: str | Path, *, initial_capital: float = 10_000.0
+) -> dict:
+    development_path = Path(development_result_path)
+    development = json.loads(development_path.read_text(encoding="utf-8"))
+    selected = _trl005_recompute_selected(development)
+    output = {
+        "order": "TRL-005",
+        "phase": "validation",
+        "market": "BTCUSDT Spot",
+        "interval": "4h UTC",
+        "development_result_sha256": _sha256_file(development_path),
+        "selected_for_validation": selected,
+        "validation_opened": bool(selected),
+        "final_test_opened": False,
+        "paper_trading_started": False,
+        "cash_reference": _trl005_cash_reference(initial_capital),
+        "engine_sha256": _sha256_file(Path(__file__)),
+    }
+    if not selected:
+        output.update({"data": None, "benchmarks": {}, "experiments": {}, "benchmark_runs": 0, "strategy_runs": 0})
+        return output
+
+    root = Path(dataset_dir)
+    start, end, expected_rows = TRL005_WINDOWS["validation"]
+    loaded = load_binance_vision_klines(
+        root, start_session=date(2018, 1, 1), end_session=end, symbol="BTCUSDT", interval="4h"
+    )
+    all_bars = loaded.bars
+    history = tuple(bar for bar in all_bars if bar.session[:10] < start.isoformat())
+    validation_bars = tuple(bar for bar in all_bars if start.isoformat() <= bar.session[:10] <= end.isoformat())
+    if len(history) != TRL005_WINDOWS["development"][2] or len(validation_bars) != expected_rows:
+        raise ValueError("TRL-005 validation/warm-up calendar count mismatch")
+    constraints_path = root.parent / "1d" / "exchange_filters_snapshot.json"
+    constraints = load_binance_quantity_constraints(constraints_path, symbol="BTCUSDT")
+
+    benchmarks = {}
+    for scenario, costs in TRL005_COSTS.items():
+        result = run_buy_and_hold(validation_bars, initial_capital=initial_capital, costs=costs, constraints=constraints)
+        metrics = compute_window_metrics(result, start_session=start, end_session=end)
+        benchmarks[scenario] = {"metrics": asdict(metrics), "diagnostics": _result_diagnostics(result)}
+
+    experiments = {}
+    for item in selected:
+        experiment_id, config_id = item["experiment_id"], item["config_id"]
+        frozen = next(c for c in TRL005_STRATEGIES[experiment_id]["configs"] if c["config_id"] == config_id)
+        policy = make_exp_strategy_policy(experiment_id, frozen["parameters"])
+        cost_scenarios = {}
+        for scenario, costs in TRL005_COSTS.items():
+            result = run_backtest(
+                validation_bars, initial_capital=initial_capital, costs=costs,
+                constraints=constraints, signal_policy=policy, signal_history=history,
+            )
+            metrics = compute_window_metrics(result, start_session=start, end_session=end)
+            cost_scenarios[scenario] = _trl005_run_record(result, metrics)
+        decision = _trl005_validation_gates(
+            cost_scenarios["base"]["metrics"],
+            cost_scenarios["stress_double_all_costs"]["metrics"],
+            benchmarks["base"]["metrics"],
+            benchmarks["stress_double_all_costs"]["metrics"],
+        )
+        for scenario, record in cost_scenarios.items():
+            record["return_difference_vs_buy_and_hold_pp"] = (
+                record["metrics"]["net_return_pct"] - benchmarks[scenario]["metrics"]["net_return_pct"]
+            )
+            record["return_difference_vs_cash_pp"] = record["metrics"]["net_return_pct"]
+        experiments[experiment_id] = {
+            "config_id": config_id,
+            "parameters": frozen["parameters"],
+            "cost_scenarios": cost_scenarios,
+            "validation_decision": decision,
+        }
+
+    output.update({
+        "data": {
+            "source": "Binance Vision Spot monthly klines",
+            "symbol": "BTCUSDT",
+            "interval": "4h",
+            "loaded_period_for_causal_warmup": "2018-01-01 through 2023-12-31",
+            "archive_count_loaded": loaded.archive_count,
+            "rows_loaded": len(all_bars),
+            "development_warmup_rows": len(history),
+            "validation_rows": len(validation_bars),
+            "milliseconds_rows": loaded.milliseconds_rows,
+            "microseconds_rows": loaded.microseconds_rows,
+            "download_manifest_sha256": loaded.manifest_sha256,
+        },
+        "initial_capital_usdt": initial_capital,
+        "quantity_constraints": asdict(constraints),
+        "cost_scenarios_bps": {name: asdict(model) for name, model in TRL005_COSTS.items()},
+        "benchmarks": benchmarks,
+        "benchmark_runs": 2,
+        "strategy_runs": 2 * len(selected),
+        "experiments": experiments,
+    })
+    return output
+
+
+def run_trl005(
+    dataset_dir: str | Path, *, phase: str = "development", development_result_path: str | Path | None = None,
+    initial_capital: float = 10_000.0,
+) -> dict:
+    if phase == "development":
+        return run_trl005_development(dataset_dir, initial_capital=initial_capital)
+    if phase == "validation":
+        if development_result_path is None:
+            raise ValueError("validation phase requires --development-results")
+        return run_trl005_validation(
+            dataset_dir, development_result_path, initial_capital=initial_capital
+        )
+    raise ValueError("TRL-005 phase must be development or validation")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Run frozen BTCUSDT/ETHUSDT research configurations with the deterministic daily-bar engine.")
+    parser = argparse.ArgumentParser(description="Run deterministic BTCUSDT daily and frozen H4 research with the existing engine.")
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--experiment", choices=("EXP-001", "TRL-003", "TRL-004"), default="EXP-001")
+    parser.add_argument("--experiment", choices=("EXP-001", "TRL-003", "TRL-004", "TRL-005"), default="EXP-001")
+    parser.add_argument("--phase", choices=("development", "validation"), default="development")
+    parser.add_argument("--development-results")
     args = parser.parse_args()
     if args.experiment == "EXP-001":
+        if args.phase != "development" or args.development_results:
+            parser.error("--phase and --development-results apply only to TRL-005")
         result = run_exp001(args.dataset_dir)
     elif args.experiment == "TRL-003":
+        if args.phase != "development" or args.development_results:
+            parser.error("--phase and --development-results apply only to TRL-005")
         result = run_trl003(args.dataset_dir)
-    else:
+    elif args.experiment == "TRL-004":
+        if args.phase != "development" or args.development_results:
+            parser.error("--phase and --development-results apply only to TRL-005")
         result = run_trl004(args.dataset_dir)
+    else:
+        result = run_trl005(
+            args.dataset_dir, phase=args.phase, development_result_path=args.development_results
+        )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
