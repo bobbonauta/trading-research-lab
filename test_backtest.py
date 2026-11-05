@@ -506,6 +506,8 @@ class BacktestTests(unittest.TestCase):
         )[0]
         policy = make_exp_strategy_policy("EXP-005", {"breakout_lookback": 12})
         self.assertEqual(policy(history + [trigger], False, 0), SignalDecision("BUY", "exp005_compression_breakout"))
+        policy_24 = make_exp_strategy_policy("EXP-005", {"breakout_lookback": 24})
+        self.assertEqual(policy_24(history + [trigger], False, 0), SignalDecision("BUY", "exp005_compression_breakout"))
         no_breakout = Bar(trigger.session, 100.0, 105.0, 99.5, 101.0, 150.0, trigger.close_time)
         self.assertIsNone(policy(history + [no_breakout], False, 0))
         low_volume = Bar(trigger.session, 100.0, 105.0, 99.5, 104.0, 124.0, trigger.close_time)
@@ -525,6 +527,8 @@ class BacktestTests(unittest.TestCase):
         policy = make_exp_strategy_policy("EXP-006", {"shock_multiple": 2.5})
         history = make_h4_bars(stable_closes, highs=stable_highs, lows=stable_lows)
         self.assertEqual(policy(history + [shock], False, 0), SignalDecision("BUY", "exp006_capitulation_entry"))
+        policy_20 = make_exp_strategy_policy("EXP-006", {"shock_multiple": 2.0})
+        self.assertEqual(policy_20(history + [shock], False, 0), SignalDecision("BUY", "exp006_capitulation_entry"))
         quiet_shock = Bar(shock.session, shock.open, shock.high, shock.low, shock.close, 199.0, shock.close_time)
         self.assertIsNone(policy(history + [quiet_shock], False, 0))
         recovery = make_h4_bars([100.0] * 6 + [101.0])
